@@ -55,17 +55,13 @@ final class ClaudeAgentSDKAPI {
     // request cannot leave the voice lane suspended forever.
     private static let requestTimeoutNanoseconds: UInt64 = 120_000_000_000
 
-    init?(
+    init(
         model: String = "claude-haiku-4-5",
         maxOutputTokens: Int = 64_000,
         fileManager: FileManager = .default,
         workingDirectory: URL? = nil
     ) {
-        guard let executableURL = Self.findExecutable(fileManager: fileManager) else {
-            return nil
-        }
-
-        self.executableURL = executableURL
+        self.executableURL = Self.findExecutable(fileManager: fileManager)
         self.nodeExecutableURL = Self.findNodeExecutable(fileManager: fileManager)
         self.bridgeScriptURL = Self.findBridgeScript(fileManager: fileManager)
         self.fileManager = fileManager
@@ -295,8 +291,6 @@ final class ClaudeAgentSDKAPI {
     /// warm subprocess.
     private static func currentProviderFingerprint() -> Int {
         var hasher = Hasher()
-        hasher.combine(AppBundleConfiguration.anthropicBaseURL())
-        hasher.combine(AppBundleConfiguration.anthropicAPIKey())
         return hasher.finalize()
     }
 
@@ -409,7 +403,7 @@ final class ClaudeAgentSDKAPI {
         environment["PATH"] = [nodeDirectory, existingPath, baselinePath]
             .filter { !$0.isEmpty }
             .joined(separator: ":")
-        environment["OPENCLICKY_CLAUDE_EXECUTABLE"] = executableURL.path
+        environment["OPENCLICKY_CLAUDE_EXECUTABLE"] = executableURL?.path
         environment["OPENCLICKY_CLAUDE_MODEL"] = model
         environment["OPENCLICKY_CLAUDE_MAX_OUTPUT_TOKENS"] = String(maxOutputTokens)
         environment["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = String(maxOutputTokens)
@@ -428,12 +422,8 @@ final class ClaudeAgentSDKAPI {
         // affects this one subprocess — it does not touch the user's own
         // interactive `claude` CLI sessions or their ~/.claude credentials.
         environment.removeValue(forKey: "ANTHROPIC_AUTH_TOKEN")
-        environment["ANTHROPIC_BASE_URL"] = AppBundleConfiguration.anthropicBaseURL()
-        if let anthropicAPIKey = AppBundleConfiguration.anthropicAPIKey(), !anthropicAPIKey.isEmpty {
-            environment["ANTHROPIC_API_KEY"] = anthropicAPIKey
-        } else {
-            environment.removeValue(forKey: "ANTHROPIC_API_KEY")
-        }
+        environment.removeValue(forKey: "ANTHROPIC_BASE_URL")
+        environment.removeValue(forKey: "ANTHROPIC_API_KEY")
 
         return environment
     }
