@@ -189,10 +189,9 @@ private struct CompanionResponseOverlayView: View {
                     .background(
                         shape
                             .fill(Color.black.opacity(0.82))
-                            .background(.ultraThinMaterial, in: shape)
-                            .overlay(shape.stroke(Color.white.opacity(0.10), lineWidth: 1))
-                            .shadow(color: Color.black.opacity(0.35), radius: 18, x: 0, y: 8)
+                            .shadow(color: Color.black.opacity(0.35), radius: 8, x: 0, y: 4)
                     )
+                    .overlay(shape.stroke(Color.white.opacity(0.10), lineWidth: 1))
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }

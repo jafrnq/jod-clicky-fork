@@ -226,8 +226,18 @@ try {
   emit({ type: "ready", sdkPath });
   const allowDangerousPermissions = booleanFromEnv("OPENCLICKY_CLAUDE_ALLOW_DANGEROUS_PERMISSIONS");
 
+  // Computer Use: the cua-driver MCP stdio server. On macOS `cua-driver mcp` is an
+  // app-daemon PROXY — the real automation runs inside CuaDriver.app, so Accessibility
+  // and Screen Recording stay attributed to com.trycua.driver and OpenClicky never
+  // triggers a new TCC prompt. Do NOT add --direct: that moves TCC onto this host.
+  const cuaDriverPath = (process.env.OPENCLICKY_CUA_DRIVER_PATH || "").trim();
+  const mcpServers = cuaDriverPath
+    ? { cua: { type: "stdio", command: cuaDriverPath, args: ["mcp"], timeout: 30000 } }
+    : {};
+
   const options = {
     model: process.env.OPENCLICKY_CLAUDE_MODEL || "claude-sonnet-4-6",
+    effort: (process.env.OPENCLICKY_CLAUDE_EFFORT || "high"),
     maxTokens: integerFromEnv("OPENCLICKY_CLAUDE_MAX_OUTPUT_TOKENS", 180),
     cwd: process.env.OPENCLICKY_CLAUDE_CWD || process.cwd(),
     systemPrompt: process.env.OPENCLICKY_CLAUDE_SYSTEM_PROMPT || "You are OpenClicky.",
@@ -235,6 +245,7 @@ try {
     // No auto-approved tools: the voice lane is vision+text only; everything else falls through to permissionMode.
     allowedTools: (process.env.OPENCLICKY_CLAUDE_ALLOWED_TOOLS || "").split(",").map(s=>s.trim()).filter(Boolean),
     disallowedTools: ["Bash","BashOutput","KillShell","Task","Write","Edit","MultiEdit","NotebookEdit"],
+    mcpServers,
     permissionMode: allowDangerousPermissions ? "bypassPermissions" : (process.env.OPENCLICKY_CLAUDE_PERMISSION_MODE || "default"),
     allowDangerouslySkipPermissions: allowDangerousPermissions,
     dangerouslyDisableSandbox: allowDangerousPermissions,

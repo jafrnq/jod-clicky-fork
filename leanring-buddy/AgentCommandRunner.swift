@@ -3,20 +3,29 @@ import Darwin
 
 @MainActor enum AgentCommandRunner {
     static let workspaceURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".clicky/workspace", isDirectory: true)
+    static let proceduresURL = workspaceURL.appendingPathComponent("procedures", isDirectory: true)
     
     static func ensureWorkspaceExists() {
         let fm = FileManager.default
         try? fm.createDirectory(at: workspaceURL, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: proceduresURL, withIntermediateDirectories: true)
         let notesURL = workspaceURL.appendingPathComponent("NOTES.md")
         if !fm.fileExists(atPath: notesURL.path) {
             try? "".write(to: notesURL, atomically: true, encoding: .utf8)
         }
     }
     
+    static func saveProcedure(trigger: String, recipe: String) {
+        let safeName = trigger.replacingOccurrences(of: " ", with: "-").replacingOccurrences(of: "/", with: "-").lowercased()
+        let fileURL = proceduresURL.appendingPathComponent("\(safeName).md")
+        let content = "TRIGGER: \(trigger)\n\n\(recipe)"
+        try? content.write(to: fileURL, atomically: true, encoding: .utf8)
+    }
+    
     static func askUserToApprove(command: String) -> Bool {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "Clicky wants to run a command"
+        alert.messageText = "Clicky wants to confirm"
         alert.informativeText = command
         alert.addButton(withTitle: "Cancel")   // FIRST = default = safe
         alert.addButton(withTitle: "Run")

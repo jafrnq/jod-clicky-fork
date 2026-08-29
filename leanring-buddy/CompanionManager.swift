@@ -9,6 +9,7 @@
 
 import AVFoundation
 import Combine
+import CoreAudio
 import Foundation
 import PostHog
 import ScreenCaptureKit
@@ -141,9 +142,11 @@ final class CompanionManager: ObservableObject {
             try? await Task.sleep(nanoseconds: 700_000_000)
             guard !Task.isCancelled, let self, self.ttsGeneration == currentGen else { return }
             let buffer = self.streamedSpeechBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !buffer.isEmpty, !buffer.contains("[POINT:"), !buffer.contains("[RUN:") {
+            if !buffer.isEmpty, !buffer.contains("[POINT:"), !buffer.contains("[RUN:"), !buffer.contains("[ASK:") {
                 let stripped = buffer.replacingOccurrences(of: #"\[POINT:[^\]]*\]"#, with: "", options: .regularExpression)
                                      .replacingOccurrences(of: #"\[RUN:[^\]]*\]"#, with: "", options: .regularExpression)
+                                     .replacingOccurrences(of: #"\[ASK:[^\]]*\]"#, with: "", options: .regularExpression)
+                                     .replacingOccurrences(of: #"\[LEARN:[^\]]*\]"#, with: "", options: .regularExpression)
                 if !stripped.isEmpty {
                     self.enqueueSpokenSentence(stripped)
                     self.streamedSpeechBuffer = ""
@@ -159,11 +162,15 @@ final class CompanionManager: ObservableObject {
         var work = text
         work = work.replacingOccurrences(of: #"\[POINT:[^\]]*\]"#, with: "", options: .regularExpression)
                    .replacingOccurrences(of: #"\[RUN:[^\]]*\]"#, with: "", options: .regularExpression)
+                   .replacingOccurrences(of: #"\[ASK:[^\]]*\]"#, with: "", options: .regularExpression)
+                   .replacingOccurrences(of: #"\[LEARN:[^\]]*\]"#, with: "", options: .regularExpression)
 
         // If an incomplete tag remains, only allow splitting the prefix before it.
         let pointOpen = work.range(of: "[POINT:")
         let runOpen = work.range(of: "[RUN:")
-        if let open = [pointOpen, runOpen].compactMap({ $0 }).min(by: { $0.lowerBound < $1.lowerBound }) {
+        let askOpen = work.range(of: "[ASK:")
+        let learnOpen = work.range(of: "[LEARN:")
+        if let open = [pointOpen, runOpen, askOpen, learnOpen].compactMap({ $0 }).min(by: { $0.lowerBound < $1.lowerBound }) {
             let prefix = String(work[..<open.lowerBound])
             guard let (sentence, prefixRemainder) = Self.splitFirstCompleteSentence(from: prefix) else { return nil }
             // Keep the un-split prefix remainder plus the tag portion in the buffer.
@@ -255,6 +262,8 @@ final class CompanionManager: ObservableObject {
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var toggleDictateModeShortcutCancellable: AnyCancellable?
+    private var priorMuteState: Bool?
+    private var mutedDeviceID: AudioDeviceID?
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
@@ -276,7 +285,7 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var isOverlayVisible: Bool = false
 
     /// The Claude model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-haiku-4-5"
+    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
 
     func setSelectedModel(_ model: String) {
         selectedModel = model
@@ -313,6 +322,13 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: "clickyAgentMode")
         claudeAgentSDK.agentModeEnabled = enabled
         claudeAgentSDK.maxOutputTokens = enabled ? 600 : 180
+    }
+    
+    @Published var isMuteSystemAudioEnabled = UserDefaults.standard.bool(forKey: "clickyMuteOnControlCmd")
+    func setMuteSystemAudioEnabled(_ enabled: Bool) {
+        isMuteSystemAudioEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "clickyMuteOnControlCmd")
+        if !enabled { restoreSystemAudio() }
     }
     
     private func toggleDictateModeFromShortcut() {
@@ -513,6 +529,7 @@ final class CompanionManager: ObservableObject {
 
 
     func stop() {
+        restoreSystemAudio()
         globalPushToTalkShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
@@ -657,18 +674,23 @@ final class CompanionManager: ObservableObject {
         voiceStateCancellable = buddyDictationManager.$isRecordingFromKeyboardShortcut
             .combineLatest(
                 buddyDictationManager.$isFinalizingTranscript,
-                buddyDictationManager.$isPreparingToRecord
+                buddyDictationManager.$isPreparingToRecord,
+                buddyDictationManager.$isRecordingFromMicrophoneButton
             )
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] isRecording, isFinalizing, isPreparing in
+            .sink { [weak self] isRecording, isFinalizing, isPreparing, isMicRecording in
                 guard let self else { return }
+                if self.isMuteSystemAudioEnabled {
+                    let isCaptureActive = (isPreparing || isRecording || isMicRecording)
+                    isCaptureActive ? self.muteSystemAudio() : self.restoreSystemAudio()
+                }
                 // Don't override .responding — the AI response pipeline
                 // manages that state directly until streaming finishes.
                 guard self.voiceState != .responding else { return }
 
                 if isFinalizing {
                     self.voiceState = .processing
-                } else if isRecording {
+                } else if isRecording || isMicRecording {
                     self.voiceState = .listening
                 } else if isPreparing {
                     self.voiceState = .processing
@@ -701,6 +723,30 @@ final class CompanionManager: ObservableObject {
             .sink { [weak self] in
                 self?.toggleDictateModeFromShortcut()
             }
+    }
+
+    private func muteSystemAudio() {
+        guard mutedDeviceID == nil else { return }
+        var defaultOutputDeviceID = kAudioObjectUnknown
+        var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var size = UInt32(MemoryLayout.size(ofValue: defaultOutputDeviceID))
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &size, &defaultOutputDeviceID) == noErr else { return }
+        self.mutedDeviceID = defaultOutputDeviceID
+        var mute: UInt32 = 0
+        var muteAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
+        var muteSize = UInt32(MemoryLayout.size(ofValue: mute))
+        let status = AudioObjectGetPropertyData(defaultOutputDeviceID, &muteAddress, 0, nil, &muteSize, &mute)
+        self.priorMuteState = (status == noErr) ? (mute != 0) : false
+        var muteVal: UInt32 = 1
+        AudioObjectSetPropertyData(defaultOutputDeviceID, &muteAddress, 0, nil, muteSize, &muteVal)
+    }
+    private func restoreSystemAudio() {
+        guard let deviceID = mutedDeviceID, let prior = priorMuteState else { return }
+        var muteVal: UInt32 = prior ? 1 : 0
+        var muteAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
+        AudioObjectSetPropertyData(deviceID, &muteAddress, 0, nil, UInt32(MemoryLayout.size(ofValue: muteVal)), &muteVal)
+        self.mutedDeviceID = nil
+        self.priorMuteState = nil
     }
 
     private func handleShortcutTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
@@ -830,7 +876,7 @@ final class CompanionManager: ObservableObject {
                     if let region = regionToCapture {
                         return [try await CompanionScreenCaptureUtility.captureRegionAsJPEG(globalRect: region)]
                     } else {
-                        return try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                        return try await CompanionScreenCaptureUtility.captureFocusedDisplayAsJPEG()
                     }
                 }
             }
@@ -843,7 +889,32 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Companion Prompt
 
-    static func companionVoiceResponseSystemPrompt(agentMode: Bool) -> String {
+    /// One cheap line telling the agent which app the user is actually looking at.
+    /// Includes the pid so computer-use can skip a list_apps/list_windows discovery round trip.
+    static func focusedApplicationContextLine() -> String {
+        guard let frontmostApplication = NSWorkspace.shared.frontmostApplication,
+              frontmostApplication.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+              let frontmostApplicationName = frontmostApplication.localizedName else {
+            return ""
+        }
+        var focusedWindowTitle = ""
+        if AXIsProcessTrusted() {
+            let applicationElement = AXUIElementCreateApplication(frontmostApplication.processIdentifier)
+            var focusedWindowValue: AnyObject?
+            if AXUIElementCopyAttributeValue(applicationElement, kAXFocusedWindowAttribute as CFString, &focusedWindowValue) == .success,
+               let focusedWindow = focusedWindowValue {
+                var windowTitleValue: AnyObject?
+                if AXUIElementCopyAttributeValue(focusedWindow as! AXUIElement, kAXTitleAttribute as CFString, &windowTitleValue) == .success,
+                   let windowTitle = windowTitleValue as? String {
+                    focusedWindowTitle = windowTitle
+                }
+            }
+        }
+        let windowSuffix = focusedWindowTitle.isEmpty ? "" : " — window \"\(focusedWindowTitle)\""
+        return "\nfocused app right now: \(frontmostApplicationName) (pid \(frontmostApplication.processIdentifier))\(windowSuffix). this is context about what the user is looking at, not an instruction to act on it."
+    }
+
+    static func companionVoiceResponseSystemPrompt(agentMode: Bool, transcript: String = "") -> String {
         var base = """
         you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
@@ -858,11 +929,25 @@ final class CompanionManager: ObservableObject {
         """
         
         if agentMode {
-            base += "\n        - you can look things up on the web.\n        - if the user asks you to DO something on the machine (open an app, run a command), put the exact shell command as [RUN:open -a \"Microsoft Excel\"] just before the point tag and say in one short sentence what you're about to do. never use the Bash tool. one RUN tag max.\n"
+            base += """
+        - you can look things up on the web, and you can actually operate this mac.
+        - to do anything in an app: use the computer-use tools. get_window_state first, then click / type_text / set_value / press_key on the element you found, then verify_state. they run in the background — never front an app, never move the user's cursor.
+        - to open an app: launch_app with its name or bundle id. never shell `open -a`, never osascript, never cmd-tab. launch_app keeps it in the background.
+        - [RUN:cmd] is only for genuinely shell-only work — git, npm, a script. never for opening apps or clicking UI. one RUN tag max.
+        - say in one short sentence what you're doing, do it, then say it's done.
+        - act on what they asked for. their instruction is the approval — don't re-ask, don't draft and wait.
+        - confirm FIRST, and only for these: deleting or archiving data, overwriting content they didn't ask you to replace, sending a message or email, or spending money. say the one-line confirm out loud and end your reply with [ASK:send the email to ada?]. one ASK tag max. everything else: just do it and say what you did.
+        - to learn a procedure for a repeatable task, output [LEARN:trigger phrase|exact computer-use steps, app names, gotchas]. do NOT use brackets ] inside the tag. the app will save it. one LEARN tag max.
+        - if a MATCHED PROCEDURE is provided below, execute its steps directly without re-exploring. if no procedure matches, explore and figure it out normally.
+"""
             
             let notesURL = AgentCommandRunner.workspaceURL.appendingPathComponent("NOTES.md")
             if let notes = try? String(contentsOf: notesURL, encoding: .utf8) {
                 base += "\n\nWorkspace Notes:\n" + String(notes.prefix(2000))
+            }
+            
+            if !transcript.isEmpty {
+                base += Self.proceduresContext(for: transcript)
             }
         } else {
             base += "\n        - you cannot run commands, click, launch apps, or change anything on this machine. you only look and talk. never say what you \"can\" or \"can't\" do for them — describe and advise. if you can't see something, say you can't see it, don't conclude it isn't installed.\n"
@@ -908,7 +993,7 @@ final class CompanionManager: ObservableObject {
                 if let captureTask = pendingScreenCaptureTask {
                     screenCaptures = try await captureTask.value
                 } else {
-                    screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                    screenCaptures = try await CompanionScreenCaptureUtility.captureFocusedDisplayAsJPEG()
                 }
                 pendingScreenCaptureTask = nil
 
@@ -929,7 +1014,8 @@ final class CompanionManager: ObservableObject {
 
                 let (fullResponseText, _) = try await claudeAgentSDK.analyzeImageStreaming(
                     images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt(agentMode: isAgentModeEnabled),
+                    systemPrompt: Self.companionVoiceResponseSystemPrompt(agentMode: isAgentModeEnabled, transcript: transcript)
+                        + Self.focusedApplicationContextLine(),
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
                     // Stream speech: sentence-by-sentence as Claude responds,
@@ -943,6 +1029,10 @@ final class CompanionManager: ObservableObject {
                             .replacingOccurrences(of: #"\[POINT:[^\]]*$"#, with: "", options: .regularExpression)
                             .replacingOccurrences(of: #"\[RUN:[^\]]*\]"#, with: "", options: .regularExpression)
                             .replacingOccurrences(of: #"\[RUN:[^\]]*$"#, with: "", options: .regularExpression)
+                            .replacingOccurrences(of: #"\[ASK:[^\]]*\]"#, with: "", options: .regularExpression)
+                            .replacingOccurrences(of: #"\[ASK:[^\]]*$"#, with: "", options: .regularExpression)
+                            .replacingOccurrences(of: #"\[LEARN:[^\]]*\]"#, with: "", options: .regularExpression)
+                            .replacingOccurrences(of: #"\[LEARN:[^\]]*$"#, with: "", options: .regularExpression)
                             .trimmingCharacters(in: .whitespacesAndNewlines)
                         if !stripped.isEmpty {
                             if wasEmpty {
@@ -956,10 +1046,17 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
-                // Strip [RUN:...] before [POINT:...] so neither tag survives into spokenText/History.
-                let runParseBeforePoint = Self.parseRunCommand(from: fullResponseText)
+                // Strip [LEARN:], [ASK:], and [RUN:] before [POINT:...] so no tag survives into spokenText/History.
+                let learnParseBeforePoint = Self.parseLearnProcedure(from: fullResponseText)
+                let askParseBeforePoint = Self.parseAskQuestion(from: learnParseBeforePoint.spokenText)
+                let runParseBeforePoint = Self.parseRunCommand(from: askParseBeforePoint.spokenText)
                 let parseResult = Self.parsePointingCoordinates(from: runParseBeforePoint.spokenText)
-                let runParseAfterPoint = Self.parseRunCommand(from: parseResult.spokenText)
+                let learnParseAfterPoint = Self.parseLearnProcedure(from: parseResult.spokenText)
+                let askParseAfterPoint = Self.parseAskQuestion(from: learnParseAfterPoint.spokenText)
+                let runParseAfterPoint = Self.parseRunCommand(from: askParseAfterPoint.spokenText)
+                
+                let parsedLearnData = learnParseBeforePoint.learnData ?? learnParseAfterPoint.learnData
+                let parsedAskQuestion = askParseBeforePoint.question ?? askParseAfterPoint.question
                 let parsedRunCommand = runParseBeforePoint.command ?? runParseAfterPoint.command
                 let spokenText = runParseAfterPoint.spokenText
 
@@ -1010,7 +1107,6 @@ final class CompanionManager: ObservableObject {
                         y: appKitY + displayFrame.origin.y
                     )
 
-                    responseOverlay.hideOverlay()
                     detectedElementScreenLocation = globalLocation
                     detectedElementDisplayFrame = displayFrame
                     ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
@@ -1028,6 +1124,29 @@ final class CompanionManager: ObservableObject {
                             enqueueSpokenSentence("done")
                         } else {
                             enqueueSpokenSentence("okay, skipped it")
+                        }
+                    }
+                }
+                
+                if isAgentModeEnabled, let confirmationQuestion = parsedAskQuestion {
+                    while ttsIsPlaying { try? await Task.sleep(nanoseconds: 200_000_000) }
+                    if !Task.isCancelled {
+                        if AgentCommandRunner.askUserToApprove(command: confirmationQuestion) {
+                            sendTranscriptToClaudeWithScreenshot(transcript: "approved. go ahead: \(confirmationQuestion)")
+                        } else {
+                            enqueueSpokenSentence("okay, skipped it")
+                        }
+                    }
+                }
+                
+                if isAgentModeEnabled, let learnData = parsedLearnData {
+                    while ttsIsPlaying { try? await Task.sleep(nanoseconds: 200_000_000) }
+                    if !Task.isCancelled {
+                        if AgentCommandRunner.askUserToApprove(command: "Save procedure for '\(learnData.trigger)'?") {
+                            AgentCommandRunner.saveProcedure(trigger: learnData.trigger, recipe: learnData.recipe)
+                            enqueueSpokenSentence("procedure saved.")
+                        } else {
+                            enqueueSpokenSentence("okay, i won't save it.")
                         }
                     }
                 }
@@ -1052,7 +1171,7 @@ final class CompanionManager: ObservableObject {
                 // trailing punctuation) so nothing is lost.
                 speechFlushTask?.cancel()
                 if !streamedSpeechBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    let finalChunk = streamedSpeechBuffer.replacingOccurrences(of: #"\[POINT:[^\]]*\]"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[POINT:[^\]]*$"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[RUN:[^\]]*\]"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[RUN:[^\]]*$"#, with: "", options: .regularExpression)
+                    let finalChunk = streamedSpeechBuffer.replacingOccurrences(of: #"\[POINT:[^\]]*\]"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[POINT:[^\]]*$"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[RUN:[^\]]*\]"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[RUN:[^\]]*$"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[ASK:[^\]]*\]"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[ASK:[^\]]*$"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[LEARN:[^\]]*\]"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[LEARN:[^\]]*$"#, with: "", options: .regularExpression)
                     streamedSpeechBuffer = ""
                     enqueueSpokenSentence(finalChunk)
                 }
@@ -1120,6 +1239,43 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Point Tag Parsing
 
+    static func parseLearnProcedure(from responseText: String) -> (spokenText: String, learnData: (trigger: String, recipe: String)?) {
+        let pattern = #"\[LEARN:([^\|\]]+)\|([^\]]+)\]\s*$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]),
+              let match = regex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)) else {
+            return (responseText, nil)
+        }
+        let tagRange = Range(match.range, in: responseText)!
+        let spokenText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let triggerRange = Range(match.range(at: 1), in: responseText)!
+        let recipeRange = Range(match.range(at: 2), in: responseText)!
+        return (spokenText, (String(responseText[triggerRange]).trimmingCharacters(in: .whitespacesAndNewlines), String(responseText[recipeRange]).trimmingCharacters(in: .whitespacesAndNewlines)))
+    }
+
+    static func proceduresContext(for transcript: String) -> String {
+        let proceduresURL = AgentCommandRunner.proceduresURL
+        guard let files = try? FileManager.default.contentsOfDirectory(atPath: proceduresURL.path) else { return "" }
+        var indexLines = [String]()
+        var matchedRecipe = ""
+        let lowerTranscript = transcript.lowercased()
+        for file in files where file.hasSuffix(".md") {
+            let fileURL = proceduresURL.appendingPathComponent(file)
+            guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
+            let lines = content.components(separatedBy: .newlines)
+            guard let firstLine = lines.first, firstLine.hasPrefix("TRIGGER: ") else { continue }
+            let trigger = String(firstLine.dropFirst(9))
+            indexLines.append("- \(trigger)")
+            let triggerWords = trigger.lowercased().split(separator: " ").filter { $0.count > 3 }
+            let matchCount = triggerWords.filter { lowerTranscript.contains($0) }.count
+            let isMatch = triggerWords.count >= 2 && (lowerTranscript.contains(trigger.lowercased()) || matchCount >= 2)
+            if isMatch {
+                matchedRecipe += "\n\nMATCHED PROCEDURE (\(trigger)):\n\(content)"
+            }
+        }
+        if indexLines.isEmpty { return "" }
+        return "\n\nKnown Procedures Index:\n" + indexLines.joined(separator: "\n") + matchedRecipe
+    }
+
     /// Parses a [RUN:command] tag from the end of Claude's response.
     static func parseRunCommand(from responseText: String) -> (spokenText: String, command: String?) {
         let pattern = #"\[RUN:([^\]]+)\]\s*$"#
@@ -1131,6 +1287,19 @@ final class CompanionManager: ObservableObject {
         let spokenText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
         let commandRange = Range(match.range(at: 1), in: responseText)!
         return (spokenText, String(responseText[commandRange]))
+    }
+
+    /// Parses an [ASK:question] tag from the end of Claude's response.
+    static func parseAskQuestion(from responseText: String) -> (spokenText: String, question: String?) {
+        let pattern = #"\[ASK:([^\]]+)\]\s*$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
+              let match = regex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)) else {
+            return (responseText, nil)
+        }
+        let tagRange = Range(match.range, in: responseText)!
+        let spokenText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let questionRange = Range(match.range(at: 1), in: responseText)!
+        return (spokenText, String(responseText[questionRange]))
     }
 
     /// Result of parsing a [POINT:...] tag from Claude's response.

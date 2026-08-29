@@ -40,6 +40,9 @@ struct CompanionPanelView: View {
                 
                 agentModeToggleRow
                     .padding(.horizontal, 16)
+                
+                muteSystemAudioToggleRow
+                    .padding(.horizontal, 16)
             }
 
             if !companionManager.allPermissionsGranted {
@@ -788,6 +791,40 @@ struct CompanionPanelView: View {
         }
         .buttonStyle(.plain)
         .pointerCursor()
+    }
+
+    // MARK: - Mute System Audio Toggle
+
+    private var muteSystemAudioToggleRow: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Mute Audio While Dictating")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text("Automatically mute system audio while you're dictating.")
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+            Spacer()
+            HStack(spacing: 0) {
+                muteOptionButton(label: "Off", isEnabled: false)
+                muteOptionButton(label: "On", isEnabled: true)
+            }
+            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.white.opacity(0.06)))
+            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(DS.Colors.borderSubtle, lineWidth: 0.5))
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func muteOptionButton(label: String, isEnabled: Bool) -> some View {
+        let isSelected = companionManager.isMuteSystemAudioEnabled == isEnabled
+        return Button(action: { companionManager.setMuteSystemAudioEnabled(isEnabled) }) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+                .padding(.horizontal, 10).padding(.vertical, 5)
+                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(isSelected ? Color.white.opacity(0.1) : Color.clear))
+        }.buttonStyle(.plain).pointerCursor()
     }
 
     // MARK: - DM Farza Button

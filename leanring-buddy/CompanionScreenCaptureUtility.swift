@@ -122,6 +122,89 @@ enum CompanionScreenCaptureUtility {
         return capturedScreens
     }
 
+    static func captureFocusedDisplayAsJPEG() async throws -> [CompanionScreenCapture] {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+
+        guard !content.displays.isEmpty else {
+            throw NSError(domain: "CompanionScreenCapture", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "No display available for capture"])
+        }
+
+        var nsScreenByDisplayID: [CGDirectDisplayID: NSScreen] = [:]
+        for screen in NSScreen.screens {
+            if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
+                nsScreenByDisplayID[screenNumber] = screen
+            }
+        }
+
+        let mouseLocation = NSEvent.mouseLocation
+        let ownBundle = Bundle.main.bundleIdentifier
+        let frontmostApplication = NSWorkspace.shared.frontmostApplication
+        
+        var focusedDisplay: SCDisplay? = nil
+
+        if let frontmost = frontmostApplication, frontmost.bundleIdentifier != ownBundle {
+            let activeWindows = content.windows.filter { window in
+                window.owningApplication?.bundleIdentifier == frontmost.bundleIdentifier && window.isOnScreen
+            }
+            if !activeWindows.isEmpty {
+                let primaryScreenHeight = NSScreen.screens.first?.frame.height ?? 0
+                let cgMouseLocation = CGPoint(x: mouseLocation.x, y: primaryScreenHeight - mouseLocation.y)
+                
+                let targetWindow = activeWindows.first { $0.frame.contains(cgMouseLocation) }
+                    ?? activeWindows.max { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height }
+                    ?? activeWindows.first!
+                
+                let center = CGPoint(x: targetWindow.frame.midX, y: targetWindow.frame.midY)
+                focusedDisplay = content.displays.first { $0.frame.contains(center) }
+            }
+        }
+
+        if focusedDisplay == nil {
+            focusedDisplay = content.displays.first { display in
+                let frame = nsScreenByDisplayID[display.displayID]?.frame ?? display.frame
+                return frame.contains(mouseLocation)
+            }
+        }
+
+        let targetDisplay = focusedDisplay ?? content.displays.first!
+        let ownAppWindows = content.windows.filter { $0.owningApplication?.bundleIdentifier == ownBundle }
+        let filter = SCContentFilter(display: targetDisplay, excludingWindows: ownAppWindows)
+
+        let configuration = SCStreamConfiguration()
+        let maxDimension = 1024
+        let aspectRatio = CGFloat(targetDisplay.width) / CGFloat(targetDisplay.height)
+        if targetDisplay.width >= targetDisplay.height {
+            configuration.width = maxDimension
+            configuration.height = Int(CGFloat(maxDimension) / aspectRatio)
+        } else {
+            configuration.height = maxDimension
+            configuration.width = Int(CGFloat(maxDimension) * aspectRatio)
+        }
+
+        let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+        guard let jpegData = NSBitmapImageRep(cgImage: cgImage)
+                .representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else {
+            throw NSError(domain: "CompanionScreenCapture", code: -2,
+                          userInfo: [NSLocalizedDescriptionKey: "Failed to capture screen"])
+        }
+
+        let displayFrame = nsScreenByDisplayID[targetDisplay.displayID]?.frame
+            ?? CGRect(x: targetDisplay.frame.origin.x, y: targetDisplay.frame.origin.y,
+                      width: CGFloat(targetDisplay.width), height: CGFloat(targetDisplay.height))
+
+        return [CompanionScreenCapture(
+            imageData: jpegData,
+            label: "focused screen (primary focus)",
+            isCursorScreen: true,
+            displayWidthInPoints: Int(displayFrame.width),
+            displayHeightInPoints: Int(displayFrame.height),
+            displayFrame: displayFrame,
+            screenshotWidthInPixels: configuration.width,
+            screenshotHeightInPixels: configuration.height
+        )]
+    }
+
     static func captureRegionAsJPEG(globalRect: CGRect) async throws -> CompanionScreenCapture {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         let ownBundleIdentifier = Bundle.main.bundleIdentifier

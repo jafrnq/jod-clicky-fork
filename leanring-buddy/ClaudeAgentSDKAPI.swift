@@ -33,6 +33,9 @@ final class ClaudeAgentSDKAPI {
     var maxOutputTokens: Int
     var agentModeEnabled: Bool = false
 
+    /// Claude Agent SDK reasoning effort: low|medium|high|xhigh|max.
+    var reasoningEffort: String = "high"
+
     private static func persistentBridgeSystemPrompt(agentMode: Bool) -> String {
         var base = """
         you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
@@ -48,7 +51,15 @@ final class ClaudeAgentSDKAPI {
         """
         
         if agentMode {
-            base += "\n        - you can look things up on the web.\n        - if the user asks you to DO something on the machine (open an app, run a command), put the exact shell command as [RUN:open -a \"Microsoft Excel\"] just before the point tag and say in one short sentence what you're about to do. never use the Bash tool. one RUN tag max.\n"
+            base += """
+        - you can look things up on the web, and you can actually operate this mac.
+        - to do anything in an app: use the computer-use tools. get_window_state first, then click / type_text / set_value / press_key on the element you found, then verify_state. they run in the background — never front an app, never move the user's cursor.
+        - to open an app: launch_app with its name or bundle id. never shell `open -a`, never osascript, never cmd-tab. launch_app keeps it in the background.
+        - [RUN:cmd] is only for genuinely shell-only work — git, npm, a script. never for opening apps or clicking UI. one RUN tag max.
+        - say in one short sentence what you're doing, do it, then say it's done.
+        - act on what they asked for. their instruction is the approval — don't re-ask, don't draft and wait.
+        - confirm FIRST, and only for these: deleting or archiving data, overwriting content they didn't ask you to replace, sending a message or email, or spending money. say the one-line confirm out loud and end your reply with [ASK:send the email to ada?]. one ASK tag max. everything else: just do it and say what you did.
+"""
         } else {
             base += "\n        - you cannot run commands, click, launch apps, or change anything on this machine. you only look and talk. never say what you \"can\" or \"can't\" do for them — describe and advise. if you can't see something, say you can't see it, don't conclude it isn't installed.\n"
         }
@@ -71,7 +82,7 @@ final class ClaudeAgentSDKAPI {
     private static let requestTimeoutNanoseconds: UInt64 = 120_000_000_000
 
     init(
-        model: String = "claude-haiku-4-5",
+        model: String = "claude-sonnet-4-6",
         maxOutputTokens: Int = 180,
         fileManager: FileManager = .default,
         workingDirectory: URL? = nil
@@ -119,6 +130,15 @@ final class ClaudeAgentSDKAPI {
         return (fixedCandidates + pathCandidates).first { candidate in
             fileManager.isExecutableFile(atPath: candidate.path)
         }
+    }
+
+    /// Prefers the app bundle binary; the ~/.local/bin symlink is the fallback.
+    static func findCuaDriverExecutable(fileManager: FileManager = .default) -> URL? {
+        let candidates = [
+            URL(fileURLWithPath: "/Applications/CuaDriver.app/Contents/MacOS/cua-driver", isDirectory: false),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/cua-driver", isDirectory: false)
+        ]
+        return candidates.first { fileManager.isExecutableFile(atPath: $0.path) }
     }
 
     static func findNodeExecutable(fileManager: FileManager = .default) -> URL? {
@@ -313,7 +333,9 @@ final class ClaudeAgentSDKAPI {
         var hasher = Hasher()
         hasher.combine(Self.persistentBridgeSystemPrompt(agentMode: agentModeEnabled))
         hasher.combine(agentModeEnabled)
+        hasher.combine(reasoningEffort)
         hasher.combine(maxOutputTokens)
+        hasher.combine(Self.findCuaDriverExecutable(fileManager: fileManager)?.path ?? "")
         let configHash = hasher.finalize()
 
         if let bridgeProcess,
@@ -425,6 +447,7 @@ final class ClaudeAgentSDKAPI {
             .joined(separator: ":")
         environment["OPENCLICKY_CLAUDE_EXECUTABLE"] = executableURL?.path
         environment["OPENCLICKY_CLAUDE_MODEL"] = model
+        environment["OPENCLICKY_CLAUDE_EFFORT"] = reasoningEffort
         environment["OPENCLICKY_CLAUDE_MAX_OUTPUT_TOKENS"] = String(maxOutputTokens)
         environment["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = String(maxOutputTokens)
         environment["OPENCLICKY_CLAUDE_CWD"] = workingDirectory.path
@@ -434,7 +457,24 @@ final class ClaudeAgentSDKAPI {
             fileManager: fileManager
         ).joined(separator: ":")
         environment["CLAUDE_AGENT_SDK_CLIENT_APP"] = "openclicky/1.0"
-        environment["OPENCLICKY_CLAUDE_ALLOWED_TOOLS"] = agentModeEnabled ? "WebSearch,WebFetch,Read" : ""
+        
+        let computerUseTools = [
+            "mcp__cua__list_apps", "mcp__cua__list_windows", "mcp__cua__launch_app",
+            "mcp__cua__get_window_state", "mcp__cua__click", "mcp__cua__double_click",
+            "mcp__cua__type_text", "mcp__cua__set_value", "mcp__cua__press_key",
+            "mcp__cua__hotkey", "mcp__cua__scroll", "mcp__cua__invoke_menu",
+            "mcp__cua__verify_state", "mcp__cua__zoom"
+        ]
+        let cuaDriverExecutableURL = agentModeEnabled ? Self.findCuaDriverExecutable(fileManager: fileManager) : nil
+        environment["OPENCLICKY_CLAUDE_ALLOWED_TOOLS"] = agentModeEnabled
+            ? (["WebSearch", "WebFetch", "Read"] + (cuaDriverExecutableURL == nil ? [] : computerUseTools)).joined(separator: ",")
+            : ""
+        if let cuaDriverExecutableURL {
+            environment["OPENCLICKY_CUA_DRIVER_PATH"] = cuaDriverExecutableURL.path
+        } else {
+            environment.removeValue(forKey: "OPENCLICKY_CUA_DRIVER_PATH")
+        }
+        
         environment["OPENCLICKY_CLAUDE_PERMISSION_MODE"] = "default" // acceptEdits auto-approves Write/Edit even when absent from allowedTools
 
         // Force this child process onto OpenClicky's configured Anthropic-compatible
