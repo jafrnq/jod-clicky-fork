@@ -106,6 +106,22 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
         claudeAgentSDK.model = model
     }
+    
+    @Published var selectedVoiceIdentifier: String? = UserDefaults.standard.string(forKey: AppleTTSClient.selectedVoiceIdentifierDefaultsKey)
+    func setSelectedVoiceIdentifier(_ identifier: String?) {
+        selectedVoiceIdentifier = identifier
+        if let id = identifier, !id.isEmpty {
+            UserDefaults.standard.set(id, forKey: AppleTTSClient.selectedVoiceIdentifierDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: AppleTTSClient.selectedVoiceIdentifierDefaultsKey)
+        }
+    }
+    
+    @Published var isDictateModeEnabled = UserDefaults.standard.bool(forKey: "clickyDictateMode")
+    func setDictateModeEnabled(_ enabled: Bool) {
+        isDictateModeEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "clickyDictateMode")
+    }
 
     /// User preference for whether the Clicky cursor should be shown.
     /// When toggled off, the overlay is hidden and push-to-talk is disabled.
@@ -508,10 +524,59 @@ final class CompanionManager: ObservableObject {
                         // Partial transcripts are hidden (waveform-only UI)
                     },
                     submitDraftText: { [weak self] finalTranscript in
-                        self?.lastTranscript = finalTranscript
+                        guard let self = self else { return }
+                        self.lastTranscript = finalTranscript
                         print("🗣️ Companion received transcript: \(finalTranscript)")
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
-                        self?.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        
+                        if self.isDictateModeEnabled {
+                            let text = finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !text.isEmpty else {
+                                self.voiceState = .idle
+                                self.scheduleTransientHideIfNeeded()
+                                return
+                            }
+                            
+                            let pasteboard = NSPasteboard.general
+                            pasteboard.clearContents()
+                            pasteboard.setString(text, forType: .string)
+                            
+                            Task {
+                                do {
+                                    if !WindowPositionManager.hasAccessibilityPermission() {
+                                        throw NSError(domain: "Dictate", code: 1, userInfo: nil)
+                                    }
+                                    
+                                    try await Task.sleep(nanoseconds: 150_000_000)
+                                    
+                                    let source = CGEventSource(stateID: .combinedSessionState)
+                                    let vKey = CGKeyCode(9) // kVK_ANSI_V
+                                    let keyDown = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: true)
+                                    keyDown?.flags = .maskCommand
+                                    let keyUp = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: false)
+                                    keyUp?.flags = .maskCommand
+                                    
+                                    keyDown?.post(tap: .cghidEventTap)
+                                    keyUp?.post(tap: .cghidEventTap)
+                                    
+                                    self.voiceState = .idle
+                                    self.scheduleTransientHideIfNeeded()
+                                } catch {
+                                    print("⚠️ Dictate paste failed: \(error)")
+                                    self.voiceState = .responding
+                                    do {
+                                        try await self.ttsClient.speakText("Copied to clipboard.")
+                                        // Wait until finished or transient hide handles it
+                                    } catch {
+                                        print("⚠️ Dictate TTS fallback failed")
+                                    }
+                                    self.voiceState = .idle
+                                    self.scheduleTransientHideIfNeeded()
+                                }
+                            }
+                        } else {
+                            self.sendTranscriptToClaudeWithScreenshot(transcript: finalTranscript)
+                        }
                     }
                 )
             }

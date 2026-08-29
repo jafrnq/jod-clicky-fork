@@ -13,9 +13,24 @@ public class AppleTTSClient: NSObject, AVSpeechSynthesizerDelegate {
         synthesizer.delegate = self
     }
     
+    public static let selectedVoiceIdentifierDefaultsKey = "clickyVoiceIdentifier"
+    
+    public static func availableEnglishVoices() -> [AVSpeechSynthesisVoice] {
+        return AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.language.hasPrefix("en") }
+            .sorted { $0.name < $1.name }
+    }
+    
+    private static func selectedSystemVoice() -> AVSpeechSynthesisVoice? {
+        guard let id = UserDefaults.standard.string(forKey: selectedVoiceIdentifierDefaultsKey), !id.isEmpty else {
+            return nil
+        }
+        return AVSpeechSynthesisVoice(identifier: id)
+    }
+    
     public func speakText(_ text: String) async throws {
         let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+        utterance.voice = Self.selectedSystemVoice() ?? AVSpeechSynthesisVoice(language: "en-US")
         
         hasPendingUtterance = true
         synthesizer.speak(utterance)

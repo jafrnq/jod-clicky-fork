@@ -31,6 +31,12 @@ struct CompanionPanelView: View {
 
                 modelPickerRow
                     .padding(.horizontal, 16)
+                
+                voicePickerRow
+                    .padding(.horizontal, 16)
+                
+                dictateModeToggleRow
+                    .padding(.horizontal, 16)
             }
 
             if !companionManager.allPermissionsGranted {
@@ -79,6 +85,16 @@ struct CompanionPanelView: View {
         }
         .frame(width: 320)
         .background(panelBackground)
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onChange(of: geo.size) { _ in
+                        DispatchQueue.main.async {
+                            NotificationCenter.default.post(name: .clickyResizePanel, object: nil)
+                        }
+                    }
+            }
+        )
     }
 
     // MARK: - Header
@@ -626,6 +642,81 @@ struct CompanionPanelView: View {
         let isSelected = companionManager.selectedModel == modelID
         return Button(action: {
             companionManager.setSelectedModel(modelID)
+        }) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
+    // MARK: - Voice Picker
+
+    private var voicePickerRow: some View {
+        HStack {
+            Text("Voice")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+                
+            Spacer()
+            
+            Picker("", selection: Binding(
+                get: { companionManager.selectedVoiceIdentifier ?? "" },
+                set: { companionManager.setSelectedVoiceIdentifier($0.isEmpty ? nil : $0) }
+            )) {
+                Text("Default (system)").tag("")
+                ForEach(AppleTTSClient.availableEnglishVoices(), id: \.identifier) { voice in
+                    Text(voice.name).tag(voice.identifier)
+                }
+            }
+            .labelsHidden()
+            .tint(DS.Colors.textSecondary)
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Dictate Mode Toggle
+
+    private var dictateModeToggleRow: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Dictate mode")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text("Speak → text typed into the focused app")
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+            
+            Spacer()
+            
+            HStack(spacing: 0) {
+                dictateOptionButton(label: "Off", isEnabled: false)
+                dictateOptionButton(label: "On", isEnabled: true)
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func dictateOptionButton(label: String, isEnabled: Bool) -> some View {
+        let isSelected = companionManager.isDictateModeEnabled == isEnabled
+        return Button(action: {
+            companionManager.setDictateModeEnabled(isEnabled)
         }) {
             Text(label)
                 .font(.system(size: 11, weight: .medium))
