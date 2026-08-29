@@ -409,8 +409,11 @@ struct BlueCursorView: View {
     // MARK: - Cursor Tracking
 
     private func startTrackingCursor() {
+        var lastMouseLocation = CGPoint(x: -1000, y: -1000)
         timer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { _ in
             let mouseLocation = NSEvent.mouseLocation
+            if mouseLocation == lastMouseLocation { return }
+            lastMouseLocation = mouseLocation
             self.isCursorOnThisScreen = self.screenFrame.contains(mouseLocation)
 
             // During forward flight or pointing, the buddy is NOT interrupted by
@@ -439,6 +442,9 @@ struct BlueCursorView: View {
             let buddyX = swiftUIPosition.x + 35
             let buddyY = swiftUIPosition.y + 25
             self.cursorPosition = CGPoint(x: buddyX, y: buddyY)
+        }
+        if let timer = timer {
+            RunLoop.main.add(timer, forMode: .common)
         }
     }
 

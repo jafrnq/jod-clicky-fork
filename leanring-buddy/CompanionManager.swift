@@ -65,11 +65,185 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
-    // Response text is now displayed inline on the cursor overlay via
-    // streamingResponseText, so no separate response overlay manager is needed.
+    private let responseOverlay = CompanionResponseOverlayManager()
 
-    private lazy var claudeAgentSDK = ClaudeAgentSDKAPI(model: selectedModel)
-    private let ttsClient = AppleTTSClient()
+    private lazy var claudeAgentSDK = ClaudeAgentSDKAPI(model: selectedModel, workingDirectory: AgentCommandRunner.workspaceURL)
+    private let appleTTS = AppleTTSClient()
+    private let edgeTTS = EdgeTTSClient()
+    
+    private var displayedResponseText = ""
+    /// True when the selected voice is an Edge neural voice (id starts with "edge:").
+    private var selectedEdgeVoiceID: String? {
+        guard EdgeTTSClient.isAvailable,
+              let id = selectedVoiceIdentifier, id.hasPrefix("edge:") else { return nil }
+        return String(id.dropFirst("edge:".count))
+    }
+
+    private var pendingSpokenSentences = 0
+
+    private var ttsIsPlaying: Bool {
+        appleTTS.isPlaying || edgeTTS.isPlaying || pendingSpokenSentences > 0
+    }
+
+    private func stopTTS() {
+        appleTTS.stopPlayback()
+        edgeTTS.stopPlayback()
+    }
+
+    /// Routes an utterance to the selected TTS engine: Edge neural voice when
+    /// chosen and available, Apple AVSpeechSynthesizer otherwise.
+    private func speakViaTTS(_ text: String) async throws {
+        if let edgeVoice = selectedEdgeVoiceID, EdgeTTSClient.isAvailable {
+            try await edgeTTS.speakText(text, voice: edgeVoice)
+        } else {
+            try await appleTTS.speakText(text)
+        }
+    }
+
+    // MARK: - Streaming speech
+
+    /// Buffer of streamed response text not yet handed to TTS (waits for a
+    /// sentence terminator so we don't speak half sentences).
+    private var streamedSpeechBuffer = ""
+    /// Guards the sentence TTS task chain so a cancelled turn stops queued
+    /// sentences from continuing to play while the user speaks again.
+    private var ttsGeneration = UUID()
+    private var speechChain: Task<Void, Never>?
+    private var speechFlushTask: Task<Void, Never>?
+    private var didStartSpeaking = false
+
+    /// Resets the streaming pipeline when a new interaction begins.
+    private func resetSpeechPipeline() {
+        ttsGeneration = UUID()
+        speechChain?.cancel()
+        speechChain = nil
+        speechFlushTask?.cancel()
+        speechFlushTask = nil
+        streamedSpeechBuffer = ""
+        displayedResponseText = ""
+        responseOverlay.hideOverlay()
+        didStartSpeaking = false
+        stopTTS()
+    }
+
+    /// Appends a streamed chunk and hands complete sentences (ending in
+    /// `.`, `!`, `?`, or newline) to TTS immediately, in order.
+    private func handleStreamedTextChunk(_ chunk: String) {
+        streamedSpeechBuffer += chunk
+        while let (sentence, remainder) = Self.popFirstCompleteSentence(from: streamedSpeechBuffer) {
+            enqueueSpokenSentence(sentence)
+            streamedSpeechBuffer = remainder
+        }
+        
+        speechFlushTask?.cancel()
+        let currentGen = ttsGeneration
+        speechFlushTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard !Task.isCancelled, let self, self.ttsGeneration == currentGen else { return }
+            let buffer = self.streamedSpeechBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !buffer.isEmpty, !buffer.contains("[POINT:"), !buffer.contains("[RUN:") {
+                let stripped = buffer.replacingOccurrences(of: #"\[POINT:[^\]]*\]"#, with: "", options: .regularExpression)
+                                     .replacingOccurrences(of: #"\[RUN:[^\]]*\]"#, with: "", options: .regularExpression)
+                if !stripped.isEmpty {
+                    self.enqueueSpokenSentence(stripped)
+                    self.streamedSpeechBuffer = ""
+                }
+            }
+        }
+    }
+
+    /// Splits the first complete sentence off the buffer using the terminator
+    /// characters, stripping any fully-formed [POINT:...] tags first. Never
+    /// splits inside an incomplete tag (it may contain periods in a label).
+    static func popFirstCompleteSentence(from text: String) -> (sentence: String, remainder: String)? {
+        var work = text
+        work = work.replacingOccurrences(of: #"\[POINT:[^\]]*\]"#, with: "", options: .regularExpression)
+                   .replacingOccurrences(of: #"\[RUN:[^\]]*\]"#, with: "", options: .regularExpression)
+
+        // If an incomplete tag remains, only allow splitting the prefix before it.
+        let pointOpen = work.range(of: "[POINT:")
+        let runOpen = work.range(of: "[RUN:")
+        if let open = [pointOpen, runOpen].compactMap({ $0 }).min(by: { $0.lowerBound < $1.lowerBound }) {
+            let prefix = String(work[..<open.lowerBound])
+            guard let (sentence, prefixRemainder) = Self.splitFirstCompleteSentence(from: prefix) else { return nil }
+            // Keep the un-split prefix remainder plus the tag portion in the buffer.
+            return (sentence, prefixRemainder + String(work[open.lowerBound...]))
+        }
+
+        guard let (sentence, remainder) = Self.splitFirstCompleteSentence(from: work) else { return nil }
+        return (sentence, remainder)
+    }
+
+    static func splitFirstCompleteSentence(from text: String) -> (sentence: String, remainder: String)? {
+        var searchRange = text.startIndex..<text.endIndex
+        while searchRange.lowerBound < text.endIndex {
+            guard let terminator = text[searchRange].firstIndex(where: { 
+                $0 == "." || $0 == "!" || $0 == "?" || $0 == "\n" || 
+                $0 == "," || $0 == ";" || $0 == ":" || $0 == "—" 
+            }) else { return nil }
+            
+            let end = text.index(after: terminator)
+            let candidate = String(text[..<end])
+            let char = text[terminator]
+            let isSoft = char == "," || char == ";" || char == ":" || char == "—"
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            if !isSoft || trimmed.count >= 30 {
+                if !trimmed.isEmpty {
+                    return (trimmed, String(text[end...]))
+                } else {
+                    return splitFirstCompleteSentence(from: String(text[end...]))
+                }
+            }
+            searchRange = end..<text.endIndex
+        }
+        return nil
+    }
+
+    /// Queues one sentence on the serial speech chain. Sets the voice state to
+    /// responding the moment the first sentence starts, without waiting for the
+    /// full response.
+    private func enqueueSpokenSentence(_ sentence: String) {
+        let trimmed = sentence.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard !Task.isCancelled else { return }
+
+        if !didStartSpeaking {
+            didStartSpeaking = true
+            voiceState = .responding
+        }
+
+        pendingSpokenSentences += 1
+
+        let generation = ttsGeneration
+        let previous = speechChain
+        let edgeVoice = selectedEdgeVoiceID
+        let shouldPrefetch = edgeVoice != nil && pendingSpokenSentences <= 3
+        let synthesis: Task<URL?, Never>? = shouldPrefetch ? Task { [weak self] in
+            guard let self, let v = edgeVoice else { return nil }
+            return try? await self.edgeTTS.synthesize(text: trimmed, voiceID: v)
+        } : nil
+
+        speechChain = Task { [weak self] in
+            defer { self?.pendingSpokenSentences -= 1 }
+            let url = await synthesis?.value
+            _ = await previous?.value
+            guard let self, self.ttsGeneration == generation, !Task.isCancelled else {
+                if let url { try? FileManager.default.removeItem(at: url) }
+                return
+            }
+            
+            if let url {
+                await self.edgeTTS.play(fileAt: url)
+            } else if let v = self.selectedEdgeVoiceID {
+                if let u = try? await self.edgeTTS.synthesize(text: trimmed, voiceID: v) {
+                    await self.edgeTTS.play(fileAt: u)
+                }
+            } else {
+                try? await self.appleTTS.speakText(trimmed)
+            }
+        }
+    }
 
     /// Conversation history so Claude remembers prior exchanges within a session.
     /// Each entry is the user's transcript and Claude's response.
@@ -80,10 +254,13 @@ final class CompanionManager: ObservableObject {
     private var currentResponseTask: Task<Void, Never>?
 
     private var shortcutTransitionCancellable: AnyCancellable?
+    private var toggleDictateModeShortcutCancellable: AnyCancellable?
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
     private var pendingKeyboardShortcutStartTask: Task<Void, Never>?
+    private var pendingScreenCaptureTask: Task<[CompanionScreenCapture], Error>?
+    private var pendingRegionSelection: CGRect?
     /// Scheduled hide for transient cursor mode — cancelled if the user
     /// speaks again before the delay elapses.
     private var transientHideTask: Task<Void, Never>?
@@ -99,7 +276,7 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var isOverlayVisible: Bool = false
 
     /// The Claude model used for voice responses. Persisted to UserDefaults.
-    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
+    @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-haiku-4-5"
 
     func setSelectedModel(_ model: String) {
         selectedModel = model
@@ -107,7 +284,14 @@ final class CompanionManager: ObservableObject {
         claudeAgentSDK.model = model
     }
     
-    @Published var selectedVoiceIdentifier: String? = UserDefaults.standard.string(forKey: AppleTTSClient.selectedVoiceIdentifierDefaultsKey)
+    @Published var selectedVoiceIdentifier: String? = {
+        if let saved = UserDefaults.standard.string(forKey: AppleTTSClient.selectedVoiceIdentifierDefaultsKey),
+           !saved.isEmpty {
+            return saved
+        }
+        // Default to the natural Edge neural voice when installed.
+        return EdgeTTSClient.isAvailable ? "edge:" + EdgeTTSClient.defaultVoiceID : nil
+    }()
     func setSelectedVoiceIdentifier(_ identifier: String?) {
         selectedVoiceIdentifier = identifier
         if let id = identifier, !id.isEmpty {
@@ -121,6 +305,35 @@ final class CompanionManager: ObservableObject {
     func setDictateModeEnabled(_ enabled: Bool) {
         isDictateModeEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: "clickyDictateMode")
+    }
+
+    @Published var isAgentModeEnabled = UserDefaults.standard.bool(forKey: "clickyAgentMode")
+    func setAgentModeEnabled(_ enabled: Bool) {
+        isAgentModeEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "clickyAgentMode")
+        claudeAgentSDK.agentModeEnabled = enabled
+        claudeAgentSDK.maxOutputTokens = enabled ? 600 : 180
+    }
+    
+    private func toggleDictateModeFromShortcut() {
+        let on = !isDictateModeEnabled
+        setDictateModeEnabled(on)
+        
+        let wasVisible = !displayedResponseText.isEmpty
+        if !wasVisible {
+            responseOverlay.showOverlayAndBeginStreaming()
+        }
+        
+        responseOverlay.updateStreamingText("dictate mode " + (on ? "on" : "off"))
+        
+        if !wasVisible {
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                guard !Task.isCancelled else { return }
+                self?.responseOverlay.hideOverlay()
+                self?.scheduleTransientHideIfNeeded()
+            }
+        }
     }
 
     /// User preference for whether the Clicky cursor should be shown.
@@ -180,6 +393,10 @@ final class CompanionManager: ObservableObject {
     }
 
     func start() {
+        AgentCommandRunner.ensureWorkspaceExists()
+        // Push the persisted agent-mode flag into the SDK so a relaunch with the
+        // mode ON gets the matching prompt, token budget, and tool env.
+        setAgentModeEnabled(isAgentModeEnabled)
         refreshAllPermissions()
         print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
         startPermissionPolling()
@@ -187,7 +404,7 @@ final class CompanionManager: ObservableObject {
         bindAudioPowerLevel()
         bindShortcutTransitions()        // Eagerly touch the Claude SDK so its warm-up handshake completes
         // well before the onboarding demo fires at ~40s into the video.
-        claudeAgentSDK.warmUp(systemPrompt: Self.companionVoiceResponseSystemPrompt)
+        claudeAgentSDK.warmUp(systemPrompt: Self.companionVoiceResponseSystemPrompt(agentMode: isAgentModeEnabled))
 
         // If the user already completed onboarding AND all permissions are
         // still granted, show the cursor overlay immediately. If permissions
@@ -292,6 +509,8 @@ final class CompanionManager: ObservableObject {
         detectedElementDisplayFrame = nil
         detectedElementBubbleText = nil
     }
+
+
 
     func stop() {
         globalPushToTalkShortcutMonitor.stop()
@@ -427,6 +646,7 @@ final class CompanionManager: ObservableObject {
 
     private func bindAudioPowerLevel() {
         audioPowerCancellable = buddyDictationManager.$currentAudioPowerLevel
+            .throttle(for: .milliseconds(40), scheduler: DispatchQueue.main, latest: true)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] powerLevel in
                 self?.currentAudioPowerLevel = powerLevel
@@ -474,6 +694,13 @@ final class CompanionManager: ObservableObject {
             .sink { [weak self] transition in
                 self?.handleShortcutTransition(transition)
             }
+            
+        toggleDictateModeShortcutCancellable = globalPushToTalkShortcutMonitor
+            .dictateModeTogglePublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                self?.toggleDictateModeFromShortcut()
+            }
     }
 
     private func handleShortcutTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
@@ -499,7 +726,7 @@ final class CompanionManager: ObservableObject {
 
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
-            ttsClient.stopPlayback()
+            resetSpeechPipeline()
             clearDetectedElementLocation()
 
             // Dismiss the onboarding prompt if it's showing
@@ -517,6 +744,12 @@ final class CompanionManager: ObservableObject {
             ClickyAnalytics.trackPushToTalkStarted()
 
             pendingKeyboardShortcutStartTask?.cancel()
+            pendingScreenCaptureTask?.cancel()
+            if NSEvent.modifierFlags.contains(.shift) {
+                Task { @MainActor in
+                    self.pendingRegionSelection = await RegionSelectionOverlayManager.shared.startSelection()
+                }
+            }
             pendingKeyboardShortcutStartTask = Task {
                 await buddyDictationManager.startPushToTalkFromKeyboardShortcut(
                     currentDraftText: "",
@@ -565,7 +798,7 @@ final class CompanionManager: ObservableObject {
                                     print("⚠️ Dictate paste failed: \(error)")
                                     self.voiceState = .responding
                                     do {
-                                        try await self.ttsClient.speakText("Copied to clipboard.")
+                                        try await self.speakViaTTS("Copied to clipboard.")
                                         // Wait until finished or transient hide handles it
                                     } catch {
                                         print("⚠️ Dictate TTS fallback failed")
@@ -588,6 +821,20 @@ final class CompanionManager: ObservableObject {
             ClickyAnalytics.trackPushToTalkReleased()
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
+            
+            Task { @MainActor in
+                RegionSelectionOverlayManager.shared.cancelSelection()
+                let regionToCapture = RegionSelectionOverlayManager.shared.takeLastCompletedRect() ?? self.pendingRegionSelection
+                self.pendingRegionSelection = nil
+                self.pendingScreenCaptureTask = Task {
+                    if let region = regionToCapture {
+                        return [try await CompanionScreenCaptureUtility.captureRegionAsJPEG(globalRect: region)]
+                    } else {
+                        return try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                    }
+                }
+            }
+            
             buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
         case .none:
             break
@@ -596,40 +843,49 @@ final class CompanionManager: ObservableObject {
 
     // MARK: - Companion Prompt
 
-    private static let companionVoiceResponseSystemPrompt = """
-    you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
+    static func companionVoiceResponseSystemPrompt(agentMode: Bool) -> String {
+        var base = """
+        you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
 
-    rules:
-    - default to one or two sentences. be direct and dense. BUT if the user asks you to explain more, go deeper, or elaborate, then go all out — give a thorough, detailed explanation with no length limit.
-    - all lowercase, casual, warm. no emojis.
-    - write for the ear, not the eye. short sentences. no lists, bullet points, markdown, or formatting — just natural speech.
-    - don't use abbreviations or symbols that sound weird read aloud. write "for example" not "e.g.", spell out small numbers.
-    - if the user's question relates to what's on their screen, reference specific things you see.
-    - if the screenshot doesn't seem relevant to their question, just answer the question directly.
-    - you can help with anything — coding, writing, general knowledge, brainstorming.
-    - never say "simply" or "just".
-    - don't read out code verbatim. describe what the code does or what needs to change conversationally.
-    - focus on giving a thorough, useful explanation. don't end with simple yes/no questions like "want me to explain more?" or "should i show you?" — those are dead ends that force the user to just say yes.
-    - instead, when it fits naturally, end by planting a seed — mention something bigger or more ambitious they could try, a related concept that goes deeper, or a next-level technique that builds on what you just explained. make it something worth coming back for, not a question they'd just nod to. it's okay to not end with anything extra if the answer is complete on its own.
-    - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
+        rules:
+        - one or two sentences. hard stop. only go longer if they explicitly ask you to explain more.
+        - all lowercase, casual, warm. no emojis, no lists, no markdown. write for the ear.
+        - do NOT narrate or describe the screen. only mention something on screen if it directly answers what they asked.
+        - answer the question, then stop. no follow-up questions, no suggestions, no "you could also".
+        - never say "simply" or "just". don't read code verbatim.
+        - write for the ear. spell out small numbers.
+        - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
+        """
+        
+        if agentMode {
+            base += "\n        - you can look things up on the web.\n        - if the user asks you to DO something on the machine (open an app, run a command), put the exact shell command as [RUN:open -a \"Microsoft Excel\"] just before the point tag and say in one short sentence what you're about to do. never use the Bash tool. one RUN tag max.\n"
+            
+            let notesURL = AgentCommandRunner.workspaceURL.appendingPathComponent("NOTES.md")
+            if let notes = try? String(contentsOf: notesURL, encoding: .utf8) {
+                base += "\n\nWorkspace Notes:\n" + String(notes.prefix(2000))
+            }
+        } else {
+            base += "\n        - you cannot run commands, click, launch apps, or change anything on this machine. you only look and talk. never say what you \"can\" or \"can't\" do for them — describe and advise. if you can't see something, say you can't see it, don't conclude it isn't installed.\n"
+        }
+        
+        base += "\n" + """
+        element pointing:
+        you have a small blue triangle cursor that can fly to and point at things on screen. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app, point at the relevant element. err on the side of pointing rather than not pointing, because it makes your help way more useful and concrete.
 
-    element pointing:
-    you have a small blue triangle cursor that can fly to and point at things on screen. use it whenever pointing would genuinely help the user — if they're asking how to do something, looking for a menu, trying to find a button, or need help navigating an app, point at the relevant element. err on the side of pointing rather than not pointing, because it makes your help way more useful and concrete.
+        don't point at things when it would be pointless — like if the user asks a general knowledge question, or the conversation has nothing to do with what's on screen, or you'd just be pointing at something obvious they're already looking at. but if there's a specific UI element, menu, button, or area on screen that's relevant to what you're helping with, point at it.
 
-    don't point at things when it would be pointless — like if the user asks a general knowledge question, or the conversation has nothing to do with what's on screen, or you'd just be pointing at something obvious they're already looking at. but if there's a specific UI element, menu, button, or area on screen that's relevant to what you're helping with, point at it.
+        when you point, append a coordinate tag at the very end of your response, AFTER your spoken text. the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. the origin (0,0) is the top-left corner of the image. x increases rightward, y increases downward.
 
-    when you point, append a coordinate tag at the very end of your response, AFTER your spoken text. the screenshot images are labeled with their pixel dimensions. use those dimensions as the coordinate space. the origin (0,0) is the top-left corner of the image. x increases rightward, y increases downward.
+        format: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space, and label is a short 1-3 word description of the element (like "search bar" or "save button"). if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
 
-    format: [POINT:x,y:label] where x,y are integer pixel coordinates in the screenshot's coordinate space, and label is a short 1-3 word description of the element (like "search bar" or "save button"). if the element is on the cursor's screen you can omit the screen number. if the element is on a DIFFERENT screen, append :screenN where N is the screen number from the image label (e.g. :screen2). this is important — without the screen number, the cursor will point at the wrong place.
+        if pointing wouldn't help, append [POINT:none].
 
-    if pointing wouldn't help, append [POINT:none].
-
-    examples:
-    - user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. click that and you'll get all the color wheels and curves. [POINT:1100,42:color inspector]"
-    - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. curious how it connects to the css you're looking at? [POINT:none]"
-    - user asks how to commit in xcode: "see that source control menu up top? click that and hit commit, or you can use command option c as a shortcut. [POINT:285,11:source control]"
-    - element is on screen 2 (not where cursor is): "that's over on your other monitor — see the terminal window? [POINT:400,300:terminal:screen2]"
-    """
+        examples:
+        - user asks how to color grade in final cut: "you'll want to open the color inspector — it's right up in the top right area of the toolbar. click that and you'll get all the color wheels and curves. [POINT:1100,42:color inspector]"
+        - user asks what html is: "html stands for hypertext markup language, it's basically the skeleton of every web page. [POINT:none]"
+        """
+        return base
+    }
 
     // MARK: - AI Response Pipeline
 
@@ -640,7 +896,7 @@ final class CompanionManager: ObservableObject {
     /// the buddy to fly to that element on screen.
     private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
-        ttsClient.stopPlayback()
+        resetSpeechPipeline()
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
@@ -648,7 +904,13 @@ final class CompanionManager: ObservableObject {
 
             do {
                 // Capture all connected screens so the AI has full context
-                let screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                let screenCaptures: [CompanionScreenCapture]
+                if let captureTask = pendingScreenCaptureTask {
+                    screenCaptures = try await captureTask.value
+                } else {
+                    screenCaptures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                }
+                pendingScreenCaptureTask = nil
 
                 guard !Task.isCancelled else { return }
 
@@ -667,19 +929,39 @@ final class CompanionManager: ObservableObject {
 
                 let (fullResponseText, _) = try await claudeAgentSDK.analyzeImageStreaming(
                     images: labeledImages,
-                    systemPrompt: Self.companionVoiceResponseSystemPrompt,
+                    systemPrompt: Self.companionVoiceResponseSystemPrompt(agentMode: isAgentModeEnabled),
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
-                    onTextChunk: { _ in
-                        // No streaming text display — spinner stays until TTS plays
+                    // Stream speech: sentence-by-sentence as Claude responds,
+                    // instead of waiting for the full response.
+                    onTextChunk: { [weak self] chunk in
+                        guard let self = self else { return }
+                        let wasEmpty = self.displayedResponseText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        self.displayedResponseText += chunk
+                        let stripped = self.displayedResponseText
+                            .replacingOccurrences(of: #"\[POINT:[^\]]*\]"#, with: "", options: .regularExpression)
+                            .replacingOccurrences(of: #"\[POINT:[^\]]*$"#, with: "", options: .regularExpression)
+                            .replacingOccurrences(of: #"\[RUN:[^\]]*\]"#, with: "", options: .regularExpression)
+                            .replacingOccurrences(of: #"\[RUN:[^\]]*$"#, with: "", options: .regularExpression)
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !stripped.isEmpty {
+                            if wasEmpty {
+                                self.responseOverlay.showOverlayAndBeginStreaming()
+                            }
+                            self.responseOverlay.updateStreamingText(stripped)
+                        }
+                        self.handleStreamedTextChunk(chunk)
                     }
                 )
 
                 guard !Task.isCancelled else { return }
 
-                // Parse the [POINT:...] tag from Claude's response
-                let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
-                let spokenText = parseResult.spokenText
+                // Strip [RUN:...] before [POINT:...] so neither tag survives into spokenText/History.
+                let runParseBeforePoint = Self.parseRunCommand(from: fullResponseText)
+                let parseResult = Self.parsePointingCoordinates(from: runParseBeforePoint.spokenText)
+                let runParseAfterPoint = Self.parseRunCommand(from: parseResult.spokenText)
+                let parsedRunCommand = runParseBeforePoint.command ?? runParseAfterPoint.command
+                let spokenText = runParseAfterPoint.spokenText
 
                 // Handle element pointing if Claude returned coordinates.
                 // Switch to idle BEFORE setting the location so the triangle
@@ -728,12 +1010,26 @@ final class CompanionManager: ObservableObject {
                         y: appKitY + displayFrame.origin.y
                     )
 
+                    responseOverlay.hideOverlay()
                     detectedElementScreenLocation = globalLocation
                     detectedElementDisplayFrame = displayFrame
                     ClickyAnalytics.trackElementPointed(elementLabel: parseResult.elementLabel)
                     print("🎯 Element pointing: (\(Int(pointCoordinate.x)), \(Int(pointCoordinate.y))) → \"\(parseResult.elementLabel ?? "element")\"")
                 } else {
                     print("🎯 Element pointing: \(parseResult.elementLabel ?? "no element")")
+                }
+
+                if isAgentModeEnabled, let command = parsedRunCommand {
+                    while ttsIsPlaying { try? await Task.sleep(nanoseconds: 200_000_000) }
+                    if !Task.isCancelled {
+                        if AgentCommandRunner.askUserToApprove(command: command) {
+                            let output = await AgentCommandRunner.run(command: command)
+                            conversationHistory.append((userTranscript: "(ran: \(command))", assistantResponse: output))
+                            enqueueSpokenSentence("done")
+                        } else {
+                            enqueueSpokenSentence("okay, skipped it")
+                        }
+                    }
                 }
 
                 // Save this exchange to conversation history (with the point tag
@@ -752,29 +1048,31 @@ final class CompanionManager: ObservableObject {
 
                 ClickyAnalytics.trackAIResponseReceived(response: spokenText)
 
-                // Play the response via TTS. Keep the spinner (processing state)
-                // until the audio actually starts playing, then switch to responding.
-                if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    do {
-                        try await ttsClient.speakText(spokenText)
-                        // speakText returns after player.play() — audio is now playing
-                        voiceState = .responding
-                    } catch {
-                        ClickyAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ Apple TTS error: \(error)")
-                        speakCreditsErrorFallback()
-                    }
+                // Flush any remaining streamed speech (e.g. final sentence without
+                // trailing punctuation) so nothing is lost.
+                speechFlushTask?.cancel()
+                if !streamedSpeechBuffer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    let finalChunk = streamedSpeechBuffer.replacingOccurrences(of: #"\[POINT:[^\]]*\]"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[POINT:[^\]]*$"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[RUN:[^\]]*\]"#, with: "", options: .regularExpression).replacingOccurrences(of: #"\[RUN:[^\]]*$"#, with: "", options: .regularExpression)
+                    streamedSpeechBuffer = ""
+                    enqueueSpokenSentence(finalChunk)
                 }
             } catch is CancellationError {
                 // User spoke again — response was interrupted
+                responseOverlay.hideOverlay()
             } catch {
+                responseOverlay.hideOverlay()
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
                 speakCreditsErrorFallback()
             }
 
             if !Task.isCancelled {
+                while ttsIsPlaying {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    guard !Task.isCancelled else { return }
+                }
                 voiceState = .idle
+                responseOverlay.finishStreaming()
                 scheduleTransientHideIfNeeded()
             }
         }
@@ -790,7 +1088,7 @@ final class CompanionManager: ObservableObject {
         transientHideTask?.cancel()
         transientHideTask = Task {
             // Wait for TTS audio to finish playing
-            while ttsClient.isPlaying {
+            while ttsIsPlaying {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }
@@ -821,6 +1119,19 @@ final class CompanionManager: ObservableObject {
     }
 
     // MARK: - Point Tag Parsing
+
+    /// Parses a [RUN:command] tag from the end of Claude's response.
+    static func parseRunCommand(from responseText: String) -> (spokenText: String, command: String?) {
+        let pattern = #"\[RUN:([^\]]+)\]\s*$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
+              let match = regex.firstMatch(in: responseText, range: NSRange(responseText.startIndex..., in: responseText)) else {
+            return (responseText, nil)
+        }
+        let tagRange = Range(match.range, in: responseText)!
+        let spokenText = String(responseText[..<tagRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let commandRange = Range(match.range(at: 1), in: responseText)!
+        return (spokenText, String(responseText[commandRange]))
+    }
 
     /// Result of parsing a [POINT:...] tag from Claude's response.
     struct PointingParseResult {

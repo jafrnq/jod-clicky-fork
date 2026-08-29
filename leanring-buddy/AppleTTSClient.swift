@@ -25,6 +25,9 @@ public class AppleTTSClient: NSObject, AVSpeechSynthesizerDelegate {
         guard let id = UserDefaults.standard.string(forKey: selectedVoiceIdentifierDefaultsKey), !id.isEmpty else {
             return nil
         }
+        if id.hasPrefix("edge:") {
+            return nil
+        }
         return AVSpeechSynthesisVoice(identifier: id)
     }
     

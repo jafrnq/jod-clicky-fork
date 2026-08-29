@@ -37,6 +37,9 @@ struct CompanionPanelView: View {
                 
                 dictateModeToggleRow
                     .padding(.horizontal, 16)
+                
+                agentModeToggleRow
+                    .padding(.horizontal, 16)
             }
 
             if !companionManager.allPermissionsGranted {
@@ -623,6 +626,7 @@ struct CompanionPanelView: View {
             Spacer()
 
             HStack(spacing: 0) {
+                modelOptionButton(label: "Haiku", modelID: "claude-haiku-4-5")
                 modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
                 modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
             }
@@ -672,6 +676,11 @@ struct CompanionPanelView: View {
                 set: { companionManager.setSelectedVoiceIdentifier($0.isEmpty ? nil : $0) }
             )) {
                 Text("Default (system)").tag("")
+                if EdgeTTSClient.isAvailable {
+                    ForEach(EdgeTTSClient.availableVoices()) { option in
+                        Text("\(option.name) · Edge").tag(option.id)
+                    }
+                }
                 ForEach(AppleTTSClient.availableEnglishVoices(), id: \.identifier) { voice in
                     Text(voice.name).tag(voice.identifier)
                 }
@@ -717,6 +726,55 @@ struct CompanionPanelView: View {
         let isSelected = companionManager.isDictateModeEnabled == isEnabled
         return Button(action: {
             companionManager.setDictateModeEnabled(isEnabled)
+        }) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+    // MARK: - Agent Mode Toggle
+
+    private var agentModeToggleRow: some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Agent mode")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Text("Web lookups + asks before running commands")
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+            }
+            
+            Spacer()
+            
+            HStack(spacing: 0) {
+                agentOptionButton(label: "Off", isEnabled: false)
+                agentOptionButton(label: "On", isEnabled: true)
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func agentOptionButton(label: String, isEnabled: Bool) -> some View {
+        let isSelected = companionManager.isAgentModeEnabled == isEnabled
+        return Button(action: {
+            companionManager.setAgentModeEnabled(isEnabled)
         }) {
             Text(label)
                 .font(.system(size: 11, weight: .medium))

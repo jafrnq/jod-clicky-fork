@@ -163,7 +163,7 @@ function handleSDKMessage(message) {
     const event = message.event;
     if (event?.type === "content_block_delta" && event.delta?.type === "text_delta") {
       currentText += event.delta.text || "";
-      emit({ type: "delta", id: currentRequestID, text: currentText });
+      emit({ type: "delta", id: currentRequestID, text: event.delta.text || "" });
     }
     return;
   }
@@ -228,17 +228,14 @@ try {
 
   const options = {
     model: process.env.OPENCLICKY_CLAUDE_MODEL || "claude-sonnet-4-6",
-    maxTokens: integerFromEnv("OPENCLICKY_CLAUDE_MAX_OUTPUT_TOKENS", 64000),
+    maxTokens: integerFromEnv("OPENCLICKY_CLAUDE_MAX_OUTPUT_TOKENS", 180),
     cwd: process.env.OPENCLICKY_CLAUDE_CWD || process.cwd(),
     systemPrompt: process.env.OPENCLICKY_CLAUDE_SYSTEM_PROMPT || "You are OpenClicky.",
     pathToClaudeCodeExecutable: process.env.OPENCLICKY_CLAUDE_EXECUTABLE,
-    // Auto-approve the read-only web tools so the voice lane can answer
-    // live/current questions inline (weather, prices, news) instead of
-    // handing every factual turn to a background agent. allowedTools only
-    // auto-approves these; all other tools (Bash/Read/Write/Edit/...) still
-    // fall through to permissionMode and stay blocked on a voice turn.
-    allowedTools: ["WebSearch", "WebFetch"],
-    permissionMode: allowDangerousPermissions ? "bypassPermissions" : "default",
+    // No auto-approved tools: the voice lane is vision+text only; everything else falls through to permissionMode.
+    allowedTools: (process.env.OPENCLICKY_CLAUDE_ALLOWED_TOOLS || "").split(",").map(s=>s.trim()).filter(Boolean),
+    disallowedTools: ["Bash","BashOutput","KillShell","Task","Write","Edit","MultiEdit","NotebookEdit"],
+    permissionMode: allowDangerousPermissions ? "bypassPermissions" : (process.env.OPENCLICKY_CLAUDE_PERMISSION_MODE || "default"),
     allowDangerouslySkipPermissions: allowDangerousPermissions,
     dangerouslyDisableSandbox: allowDangerousPermissions,
     sandbox: {

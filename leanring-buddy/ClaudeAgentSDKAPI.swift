@@ -31,14 +31,29 @@ final class ClaudeAgentSDKAPI {
     private let workingDirectory: URL
     var model: String
     var maxOutputTokens: Int
+    var agentModeEnabled: Bool = false
 
-    private static let persistentBridgeSystemPrompt = """
-    You are OpenClicky's persistent local Claude Agent SDK voice response session.
-    Keep the session warm and follow the current OpenClicky voice policy and context supplied with each user turn.
-    Answer like a capable coworker over the user's shoulder: one or two natural spoken sentences by default, no bullets, markdown, headings, tables, or code blocks unless explicitly requested.
-
-    
-    """
+    private static func persistentBridgeSystemPrompt(agentMode: Bool) -> String {
+        var base = """
+        you're clicky, a friendly always-on companion that lives in the user's menu bar. the user just spoke to you via push-to-talk and you can see their screen(s). your reply will be spoken aloud via text-to-speech, so write the way you'd actually talk. this is an ongoing conversation — you remember everything they've said before.
+        
+        rules:
+        - one or two sentences. hard stop. only go longer if they explicitly ask you to explain more.
+        - all lowercase, casual, warm. no emojis, no lists, no markdown. write for the ear.
+        - do NOT narrate or describe the screen. only mention something on screen if it directly answers what they asked.
+        - answer the question, then stop. no follow-up questions, no suggestions, no "you could also".
+        - never say "simply" or "just". don't read code verbatim.
+        - write for the ear. spell out small numbers.
+        - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
+        """
+        
+        if agentMode {
+            base += "\n        - you can look things up on the web.\n        - if the user asks you to DO something on the machine (open an app, run a command), put the exact shell command as [RUN:open -a \"Microsoft Excel\"] just before the point tag and say in one short sentence what you're about to do. never use the Bash tool. one RUN tag max.\n"
+        } else {
+            base += "\n        - you cannot run commands, click, launch apps, or change anything on this machine. you only look and talk. never say what you \"can\" or \"can't\" do for them — describe and advise. if you can't see something, say you can't see it, don't conclude it isn't installed.\n"
+        }
+        return base
+    }
 
     private var bridgeProcess: Process?
     private var bridgeInput: FileHandle?
@@ -49,7 +64,7 @@ final class ClaudeAgentSDKAPI {
     private var pendingRequests: [String: PendingRequest] = [:]
     private var warmupRequestID: String?
     private var activeBridgeModel: String?
-    private var activeBridgeSystemPromptHash: Int?
+    private var activeBridgeConfigurationHash: Int?
     private var activeBridgeProviderFingerprint: Int?
     // Allows a cold bridge to start normally while ensuring a wedged SDK
     // request cannot leave the voice lane suspended forever.
@@ -57,7 +72,7 @@ final class ClaudeAgentSDKAPI {
 
     init(
         model: String = "claude-haiku-4-5",
-        maxOutputTokens: Int = 64_000,
+        maxOutputTokens: Int = 180,
         fileManager: FileManager = .default,
         workingDirectory: URL? = nil
     ) {
@@ -198,7 +213,7 @@ final class ClaudeAgentSDKAPI {
         bridgeOutput = nil
         bridgeError = nil
         activeBridgeModel = nil
-        activeBridgeSystemPromptHash = nil
+        activeBridgeConfigurationHash = nil
         terminateBridgeProcess(process)
         failPendingRequests(error)
     }
@@ -295,11 +310,16 @@ final class ClaudeAgentSDKAPI {
     }
 
     private func ensureBridge() throws {
-        let promptHash = Self.persistentBridgeSystemPrompt.hashValue
+        var hasher = Hasher()
+        hasher.combine(Self.persistentBridgeSystemPrompt(agentMode: agentModeEnabled))
+        hasher.combine(agentModeEnabled)
+        hasher.combine(maxOutputTokens)
+        let configHash = hasher.finalize()
+
         if let bridgeProcess,
            bridgeProcess.isRunning,
            activeBridgeModel == model,
-           activeBridgeSystemPromptHash == promptHash,
+           activeBridgeConfigurationHash == configHash,
            bridgeInput != nil {
             return
         }
@@ -349,7 +369,7 @@ final class ClaudeAgentSDKAPI {
         process.environment = bridgeEnvironment(
             nodeExecutableURL: nodeExecutableURL,
             bridgeScriptURL: bridgeScriptURL,
-            systemPrompt: Self.persistentBridgeSystemPrompt
+            systemPrompt: Self.persistentBridgeSystemPrompt(agentMode: agentModeEnabled)
         )
 
         outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -387,7 +407,7 @@ final class ClaudeAgentSDKAPI {
         bridgeOutput = outputPipe.fileHandleForReading
         bridgeError = errorPipe.fileHandleForReading
         activeBridgeModel = model
-        activeBridgeSystemPromptHash = promptHash
+        activeBridgeConfigurationHash = configHash
 
     }
 
@@ -414,6 +434,8 @@ final class ClaudeAgentSDKAPI {
             fileManager: fileManager
         ).joined(separator: ":")
         environment["CLAUDE_AGENT_SDK_CLIENT_APP"] = "openclicky/1.0"
+        environment["OPENCLICKY_CLAUDE_ALLOWED_TOOLS"] = agentModeEnabled ? "WebSearch,WebFetch,Read" : ""
+        environment["OPENCLICKY_CLAUDE_PERMISSION_MODE"] = "default" // acceptEdits auto-approves Write/Edit even when absent from allowedTools
 
         // Force this child process onto OpenClicky's configured Anthropic-compatible
         // provider (e.g. MiniMax via ANTHROPIC_BASE_URL in secrets.env), overriding
@@ -500,7 +522,7 @@ final class ClaudeAgentSDKAPI {
             guard let requestID,
                   var pending = pendingRequests[requestID],
                   let text = event["text"] as? String else { return }
-            pending.accumulatedText = text
+            pending.accumulatedText += text
             if !pending.didReceiveFirstDelta {
                 pending.didReceiveFirstDelta = true
             }
@@ -548,7 +570,7 @@ final class ClaudeAgentSDKAPI {
         bridgeOutput = nil
         bridgeError = nil
         activeBridgeModel = nil
-        activeBridgeSystemPromptHash = nil
+        activeBridgeConfigurationHash = nil
 
         let error = NSError(
             domain: "ClaudeAgentSDKAPI",

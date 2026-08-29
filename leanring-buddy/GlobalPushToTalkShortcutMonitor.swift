@@ -14,6 +14,7 @@ import Foundation
 
 final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     let shortcutTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
+    let dictateModeTogglePublisher = PassthroughSubject<Void, Never>()
 
     private var globalEventTap: CFMachPort?
     private var globalEventTapRunLoopSource: CFRunLoopSource?
@@ -109,6 +110,14 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         }
 
         let eventKeyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+        
+        if eventType == .keyDown && eventKeyCode == 2 {
+            let flags = event.flags.intersection([.maskCommand, .maskShift, .maskAlternate, .maskControl])
+            if flags == [.maskControl, .maskShift] {
+                dictateModeTogglePublisher.send()
+            }
+        }
+
         let shortcutTransition = BuddyPushToTalkShortcut.shortcutTransition(
             for: eventType,
             keyCode: eventKeyCode,

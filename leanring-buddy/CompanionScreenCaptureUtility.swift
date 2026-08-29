@@ -57,15 +57,7 @@ enum CompanionScreenCaptureUtility {
             }
         }
 
-        // Sort displays so the cursor screen is always first
-        let sortedDisplays = content.displays.sorted { displayA, displayB in
-            let frameA = nsScreenByDisplayID[displayA.displayID]?.frame ?? displayA.frame
-            let frameB = nsScreenByDisplayID[displayB.displayID]?.frame ?? displayB.frame
-            let aContainsCursor = frameA.contains(mouseLocation)
-            let bContainsCursor = frameB.contains(mouseLocation)
-            if aContainsCursor != bContainsCursor { return aContainsCursor }
-            return false
-        }
+        let sortedDisplays = content.displays.sorted { $0.frame.minX < $1.frame.minX }
 
         var capturedScreens: [CompanionScreenCapture] = []
 
@@ -128,5 +120,64 @@ enum CompanionScreenCaptureUtility {
         }
 
         return capturedScreens
+    }
+
+    static func captureRegionAsJPEG(globalRect: CGRect) async throws -> CompanionScreenCapture {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let ownBundleIdentifier = Bundle.main.bundleIdentifier
+        let ownAppWindows = content.windows.filter { window in
+            window.owningApplication?.bundleIdentifier == ownBundleIdentifier
+        }
+
+        var nsScreenByDisplayID: [CGDirectDisplayID: NSScreen] = [:]
+        for screen in NSScreen.screens {
+            if let screenNumber = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID {
+                nsScreenByDisplayID[screenNumber] = screen
+            }
+        }
+
+        guard !content.displays.isEmpty else { throw NSError(domain:"CompanionScreenCapture", code:-1, userInfo:[NSLocalizedDescriptionKey:"No display available for capture"]) }
+
+        // Find display containing rect center
+        let centerPoint = CGPoint(x: globalRect.midX, y: globalRect.midY)
+        let targetDisplay = content.displays.first { display in
+            let frame = nsScreenByDisplayID[display.displayID]?.frame ?? display.frame
+            return frame.contains(centerPoint)
+        } ?? content.displays.first!
+
+        let screen = nsScreenByDisplayID[targetDisplay.displayID] ?? NSScreen.screens.first!
+        let screenFrame = screen.frame
+        let localX = globalRect.minX - screenFrame.minX
+        let localY = screenFrame.maxY - globalRect.maxY
+        let localRect = CGRect(x: localX, y: localY, width: globalRect.width, height: globalRect.height)
+
+        let filter = SCContentFilter(display: targetDisplay, excludingWindows: ownAppWindows)
+        let configuration = SCStreamConfiguration()
+        configuration.sourceRect = localRect
+        configuration.scalesToFit = true
+
+        let maxDimension: CGFloat = 1280
+        let maxRectDim = max(globalRect.width, globalRect.height)
+        let scale = maxRectDim > maxDimension ? maxDimension / maxRectDim : 1.0
+        let backingScale = screen.backingScaleFactor
+        configuration.width = Int(globalRect.width * scale * backingScale)
+        configuration.height = Int(globalRect.height * scale * backingScale)
+        
+        let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+        let bitmapRep = NSBitmapImageRep(cgImage: cgImage)
+        guard let jpegData = bitmapRep.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else {
+            throw NSError(domain: "CompanionScreenCapture", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to convert region capture to JPEG"])
+        }
+
+        return CompanionScreenCapture(
+            imageData: jpegData,
+            label: "the region the user selected",
+            isCursorScreen: true,
+            displayWidthInPoints: Int(globalRect.width),
+            displayHeightInPoints: Int(globalRect.height),
+            displayFrame: globalRect,
+            screenshotWidthInPixels: configuration.width,
+            screenshotHeightInPixels: configuration.height
+        )
     }
 }
