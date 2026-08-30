@@ -262,10 +262,10 @@ final class CompanionManager: ObservableObject {
 
     private var shortcutTransitionCancellable: AnyCancellable?
     private var toggleDictateModeShortcutCancellable: AnyCancellable?
-    private var priorMuteState: Bool?
-    private var mutedDeviceID: AudioDeviceID?
+
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
+
     private var accessibilityCheckTimer: Timer?
     private var pendingKeyboardShortcutStartTask: Task<Void, Never>?
     private var pendingScreenCaptureTask: Task<[CompanionScreenCapture], Error>?
@@ -286,6 +286,18 @@ final class CompanionManager: ObservableObject {
 
     /// The Claude model used for voice responses. Persisted to UserDefaults.
     @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
+    @Published var selectedMicrophoneUID: String = UserDefaults.standard.string(forKey: "selectedMicrophoneUID") ?? ""
+    @Published private(set) var availableMicrophones: [AudioInputDevice] = []
+
+    func setSelectedMicrophoneUID(_ uid: String) {
+        selectedMicrophoneUID = uid
+        UserDefaults.standard.set(uid, forKey: "selectedMicrophoneUID")
+        buddyDictationManager.targetMicrophoneUID = uid
+    }
+
+    func panelDidAppear() {
+        availableMicrophones = AudioInputDevice.fetchAvailableDevices()
+    }
 
     func setSelectedModel(_ model: String) {
         selectedModel = model
@@ -322,14 +334,20 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: "clickyAgentMode")
         claudeAgentSDK.agentModeEnabled = enabled
         claudeAgentSDK.maxOutputTokens = enabled ? 600 : 180
+        codexAgentSDK.agentModeEnabled = enabled
+        codexAgentSDK.maxOutputTokens = enabled ? 600 : 180
     }
+
+    @Published private(set) var selectedBackend: String = UserDefaults.standard.string(forKey: "clickyBackend") ?? "claude"
     
-    @Published var isMuteSystemAudioEnabled = UserDefaults.standard.bool(forKey: "clickyMuteOnControlCmd")
-    func setMuteSystemAudioEnabled(_ enabled: Bool) {
-        isMuteSystemAudioEnabled = enabled
-        UserDefaults.standard.set(enabled, forKey: "clickyMuteOnControlCmd")
-        if !enabled { restoreSystemAudio() }
+    func setSelectedBackend(_ backend: String) {
+        let valid = backend == "codex" ? "codex" : "claude"
+        selectedBackend = valid
+        UserDefaults.standard.set(valid, forKey: "clickyBackend")
     }
+    private lazy var codexAgentSDK: CodexAgentSDKAPI = CodexAgentSDKAPI()
+    
+
     
     private func toggleDictateModeFromShortcut() {
         let on = !isDictateModeEnabled
@@ -409,16 +427,33 @@ final class CompanionManager: ObservableObject {
     }
 
     func start() {
+        if UserDefaults.standard.object(forKey: "clickyMuteOnControlCmd") != nil {
+            var defaultOutputDeviceID = kAudioObjectUnknown
+            var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+            var size = UInt32(MemoryLayout.size(ofValue: defaultOutputDeviceID))
+            if AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &size, &defaultOutputDeviceID) == noErr {
+                var muteVal: UInt32 = 0
+                var muteAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
+                AudioObjectSetPropertyData(defaultOutputDeviceID, &muteAddress, 0, nil, UInt32(MemoryLayout.size(ofValue: muteVal)), &muteVal)
+            }
+            UserDefaults.standard.removeObject(forKey: "clickyMuteOnControlCmd")
+        }
+
+        buddyDictationManager.targetMicrophoneUID = selectedMicrophoneUID
+        // Warm the cached voice list off the main actor — the first
+        // AVSpeechSynthesisVoice.speechVoices() call does a synchronous AX hop that
+        // would otherwise stall the main thread when the voice picker renders.
+        Task.detached { _ = AppleTTSClient.availableEnglishVoices() }
         AgentCommandRunner.ensureWorkspaceExists()
         // Push the persisted agent-mode flag into the SDK so a relaunch with the
         // mode ON gets the matching prompt, token budget, and tool env.
         setAgentModeEnabled(isAgentModeEnabled)
-        refreshAllPermissions()
-        print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
-        startPermissionPolling()
         bindVoiceStateObservation()
         bindAudioPowerLevel()
-        bindShortcutTransitions()        // Eagerly touch the Claude SDK so its warm-up handshake completes
+        bindShortcutTransitions()
+        refreshAllPermissions()
+        print("🔑 Clicky start — accessibility: \(hasAccessibilityPermission), screen: \(hasScreenRecordingPermission), mic: \(hasMicrophonePermission), screenContent: \(hasScreenContentPermission), onboarded: \(hasCompletedOnboarding)")
+        startPermissionPolling()        // Eagerly touch the Claude SDK so its warm-up handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         claudeAgentSDK.warmUp(systemPrompt: Self.companionVoiceResponseSystemPrompt(agentMode: isAgentModeEnabled))
 
@@ -529,7 +564,6 @@ final class CompanionManager: ObservableObject {
 
 
     func stop() {
-        restoreSystemAudio()
         globalPushToTalkShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
@@ -555,8 +589,6 @@ final class CompanionManager: ObservableObject {
 
         if currentlyHasAccessibility {
             globalPushToTalkShortcutMonitor.start()
-        } else {
-            globalPushToTalkShortcutMonitor.stop()
         }
 
         hasScreenRecordingPermission = WindowPositionManager.hasScreenRecordingPermission()
@@ -680,10 +712,7 @@ final class CompanionManager: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] isRecording, isFinalizing, isPreparing, isMicRecording in
                 guard let self else { return }
-                if self.isMuteSystemAudioEnabled {
-                    let isCaptureActive = (isPreparing || isRecording || isMicRecording)
-                    isCaptureActive ? self.muteSystemAudio() : self.restoreSystemAudio()
-                }
+
                 // Don't override .responding — the AI response pipeline
                 // manages that state directly until streaming finishes.
                 guard self.voiceState != .responding else { return }
@@ -725,29 +754,7 @@ final class CompanionManager: ObservableObject {
             }
     }
 
-    private func muteSystemAudio() {
-        guard mutedDeviceID == nil else { return }
-        var defaultOutputDeviceID = kAudioObjectUnknown
-        var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        var size = UInt32(MemoryLayout.size(ofValue: defaultOutputDeviceID))
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &propertyAddress, 0, nil, &size, &defaultOutputDeviceID) == noErr else { return }
-        self.mutedDeviceID = defaultOutputDeviceID
-        var mute: UInt32 = 0
-        var muteAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
-        var muteSize = UInt32(MemoryLayout.size(ofValue: mute))
-        let status = AudioObjectGetPropertyData(defaultOutputDeviceID, &muteAddress, 0, nil, &muteSize, &mute)
-        self.priorMuteState = (status == noErr) ? (mute != 0) : false
-        var muteVal: UInt32 = 1
-        AudioObjectSetPropertyData(defaultOutputDeviceID, &muteAddress, 0, nil, muteSize, &muteVal)
-    }
-    private func restoreSystemAudio() {
-        guard let deviceID = mutedDeviceID, let prior = priorMuteState else { return }
-        var muteVal: UInt32 = prior ? 1 : 0
-        var muteAddress = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyMute, mScope: kAudioDevicePropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
-        AudioObjectSetPropertyData(deviceID, &muteAddress, 0, nil, UInt32(MemoryLayout.size(ofValue: muteVal)), &muteVal)
-        self.mutedDeviceID = nil
-        self.priorMuteState = nil
-    }
+
 
     private func handleShortcutTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
@@ -1012,12 +1019,14 @@ final class CompanionManager: ObservableObject {
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
-                let (fullResponseText, _) = try await claudeAgentSDK.analyzeImageStreaming(
+                let activeBackend: any AgentBackend = selectedBackend == "codex" ? codexAgentSDK : claudeAgentSDK
+                let (fullResponseText, _) = try await activeBackend.analyzeImageStreaming(
                     images: labeledImages,
                     systemPrompt: Self.companionVoiceResponseSystemPrompt(agentMode: isAgentModeEnabled, transcript: transcript)
                         + Self.focusedApplicationContextLine(),
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
+                    assistantPrefill: nil,
                     // Stream speech: sentence-by-sentence as Claude responds,
                     // instead of waiting for the full response.
                     onTextChunk: { [weak self] chunk in
@@ -1429,7 +1438,7 @@ final class CompanionManager: ObservableObject {
     }
 
     private func startOnboardingPromptStream() {
-        let message = "press control + option and introduce yourself"
+        let message = "press control + command and introduce yourself"
         onboardingPromptText = ""
         showOnboardingPrompt = true
         onboardingPromptOpacity = 0.0
@@ -1517,13 +1526,16 @@ final class CompanionManager: ObservableObject {
                 let dimensionInfo = " (image dimensions: \(cursorScreenCapture.screenshotWidthInPixels)x\(cursorScreenCapture.screenshotHeightInPixels) pixels)"
                 let labeledImages = [(data: cursorScreenCapture.imageData, label: cursorScreenCapture.label + dimensionInfo)]
 
-                let (fullResponseText, _) = try await claudeAgentSDK.analyzeImageStreaming(
+                let activeBackend: any AgentBackend = selectedBackend == "codex" ? codexAgentSDK : claudeAgentSDK
+                let (fullResponseText, _) = try await activeBackend.analyzeImageStreaming(
                     images: labeledImages,
                     systemPrompt: Self.onboardingDemoSystemPrompt,
+                    conversationHistory: [],
                     userPrompt: "look around my screen and find something interesting to point at",
+                    assistantPrefill: nil,
                     onTextChunk: { _ in }
                 )
-
+                
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
 
                 guard let pointCoordinate = parseResult.coordinate else {

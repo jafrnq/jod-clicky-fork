@@ -4,7 +4,7 @@
 //
 //  Captures push-to-talk keyboard shortcuts while makesomething is running in the
 //  background. Uses a listen-only CGEvent tap so modifier-only shortcuts like
-//  ctrl + option behave more like a real system-wide voice tool.
+//  Ctrl+Cmd behave more like a real system-wide voice tool.
 //
 
 import AppKit
@@ -82,6 +82,17 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
 
         CFRunLoopAddSource(CFRunLoopGetMain(), globalEventTapRunLoopSource, .commonModes)
         CGEvent.tapEnable(tap: globalEventTap, enable: true)
+        
+        let currentFlags = CGEventSource.flagsState(.combinedSessionState)
+        let transition = BuddyPushToTalkShortcut.shortcutTransition(
+            for: .flagsChanged,
+            keyCode: 0,
+            modifierFlagsRawValue: currentFlags.rawValue,
+            wasShortcutPreviouslyPressed: false
+        )
+        if transition == .pressed {
+            isShortcutCurrentlyPressed = true
+        }
     }
 
     func stop() {

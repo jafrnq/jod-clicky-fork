@@ -29,19 +29,22 @@ struct CompanionPanelView: View {
                 Spacer()
                     .frame(height: 12)
 
+                backendPickerRow
+                    .padding(.horizontal, 16)
+                    
                 modelPickerRow
                     .padding(.horizontal, 16)
                 
                 voicePickerRow
+                    .padding(.horizontal, 16)
+                    
+                microphonePickerRow
                     .padding(.horizontal, 16)
                 
                 dictateModeToggleRow
                     .padding(.horizontal, 16)
                 
                 agentModeToggleRow
-                    .padding(.horizontal, 16)
-                
-                muteSystemAudioToggleRow
                     .padding(.horizontal, 16)
             }
 
@@ -149,7 +152,7 @@ struct CompanionPanelView: View {
     @ViewBuilder
     private var permissionsCopySection: some View {
         if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-            Text("Hold Control+Option to talk.")
+            Text("Hold Control+Cmd to talk.")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(DS.Colors.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -618,6 +621,50 @@ struct CompanionPanelView: View {
         .padding(.vertical, 4)
     }
 
+    // MARK: - Backend Picker
+    private var backendPickerRow: some View {
+        HStack {
+            Text("Backend")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Spacer()
+
+            HStack(spacing: 0) {
+                backendOptionButton(label: "Claude", backendID: "claude")
+                backendOptionButton(label: "Codex", backendID: "codex")
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(Color.white.opacity(0.06))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func backendOptionButton(label: String, backendID: String) -> some View {
+        let isSelected = companionManager.selectedBackend == backendID
+        return Button(action: {
+            companionManager.setSelectedBackend(backendID)
+        }) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
     // MARK: - Model Picker
 
     private var modelPickerRow: some View {
@@ -628,19 +675,27 @@ struct CompanionPanelView: View {
 
             Spacer()
 
-            HStack(spacing: 0) {
-                modelOptionButton(label: "Haiku", modelID: "claude-haiku-4-5")
-                modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
-                modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+            if companionManager.selectedBackend == "claude" {
+                HStack(spacing: 0) {
+                    modelOptionButton(label: "Haiku", modelID: "claude-haiku-4-5")
+                    modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
+                    modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+            } else {
+                Text(UserDefaults.standard.string(forKey: "codexModel") ?? "gpt-5.4-mini")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
             }
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-            )
         }
         .padding(.vertical, 4)
     }
@@ -694,6 +749,28 @@ struct CompanionPanelView: View {
         .padding(.vertical, 4)
     }
 
+    private var microphonePickerRow: some View {
+        HStack {
+            Text("Microphone")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+                
+            Spacer()
+            
+            Picker("", selection: Binding(
+                get: { companionManager.selectedMicrophoneUID },
+                set: { companionManager.setSelectedMicrophoneUID($0) }
+            )) {
+                Text("System Default").tag("")
+                ForEach(companionManager.availableMicrophones) { device in
+                    Text(device.name).tag(device.uid)
+                }
+            }
+            .labelsHidden()
+            .tint(DS.Colors.textSecondary)
+        }
+        .padding(.vertical, 4)
+    }
     // MARK: - Dictate Mode Toggle
 
     private var dictateModeToggleRow: some View {
@@ -793,39 +870,7 @@ struct CompanionPanelView: View {
         .pointerCursor()
     }
 
-    // MARK: - Mute System Audio Toggle
 
-    private var muteSystemAudioToggleRow: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 1) {
-                Text("Mute Audio While Dictating")
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundColor(DS.Colors.textSecondary)
-                Text("Automatically mute system audio while you're dictating.")
-                    .font(.system(size: 10))
-                    .foregroundColor(DS.Colors.textTertiary)
-            }
-            Spacer()
-            HStack(spacing: 0) {
-                muteOptionButton(label: "Off", isEnabled: false)
-                muteOptionButton(label: "On", isEnabled: true)
-            }
-            .background(RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.white.opacity(0.06)))
-            .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(DS.Colors.borderSubtle, lineWidth: 0.5))
-        }
-        .padding(.vertical, 4)
-    }
-
-    private func muteOptionButton(label: String, isEnabled: Bool) -> some View {
-        let isSelected = companionManager.isMuteSystemAudioEnabled == isEnabled
-        return Button(action: { companionManager.setMuteSystemAudioEnabled(isEnabled) }) {
-            Text(label)
-                .font(.system(size: 11, weight: .medium))
-                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
-                .padding(.horizontal, 10).padding(.vertical, 5)
-                .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(isSelected ? Color.white.opacity(0.1) : Color.clear))
-        }.buttonStyle(.plain).pointerCursor()
-    }
 
     // MARK: - DM Farza Button
 

@@ -17,6 +17,7 @@ enum BuddyPushToTalkShortcut {
     enum ShortcutOption {
         case shiftFunction
         case controlOption
+        case controlCommand
         case shiftControl
         case controlOptionSpace
         case shiftControlSpace
@@ -27,6 +28,8 @@ enum BuddyPushToTalkShortcut {
                 return "shift + fn"
             case .controlOption:
                 return "ctrl + option"
+            case .controlCommand:
+                return "ctrl + cmd"
             case .shiftControl:
                 return "shift + control"
             case .controlOptionSpace:
@@ -42,6 +45,8 @@ enum BuddyPushToTalkShortcut {
                 return ["shift", "fn"]
             case .controlOption:
                 return ["ctrl", "option"]
+            case .controlCommand:
+                return ["ctrl", "cmd"]
             case .shiftControl:
                 return ["shift", "control"]
             case .controlOptionSpace:
@@ -57,6 +62,8 @@ enum BuddyPushToTalkShortcut {
                 return [.shift, .function]
             case .controlOption:
                 return [.control, .option]
+            case .controlCommand:
+                return [.control, .command]
             case .shiftControl:
                 return [.shift, .control]
             case .controlOptionSpace, .shiftControlSpace:
@@ -69,6 +76,8 @@ enum BuddyPushToTalkShortcut {
             case .shiftFunction:
                 return nil
             case .controlOption:
+                return nil
+            case .controlCommand:
                 return nil
             case .shiftControl:
                 return nil
@@ -92,7 +101,7 @@ enum BuddyPushToTalkShortcut {
         case keyUp
     }
 
-    static let currentShortcutOption: ShortcutOption = .controlOption
+    static let currentShortcutOption: ShortcutOption = .controlCommand
     static let pushToTalkKeyCode: UInt16 = 49 // Space
     static let pushToTalkDisplayText = currentShortcutOption.displayText
     static let pushToTalkTooltipText = "push to talk (\(pushToTalkDisplayText))"
@@ -264,6 +273,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
     private let transcriptionProvider: any BuddyTranscriptionProvider
     private let audioEngine = AVAudioEngine()
+    var targetMicrophoneUID: String = ""
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
     private var activeStartSource: BuddyDictationStartSource?
     private var draftCallbacks: BuddyDictationDraftCallbacks?
@@ -463,7 +473,20 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             isPreparingToRecord = false
             print("🎙️ BuddyDictationManager: recognition session started")
         } catch {
+            // Any failure can leave a half-started engine or an installed tap
+            // behind. Tear it down here so the next press starts from a clean
+            // graph instead of re-routing a live one.
             isPreparingToRecord = false
+            audioEngine.stop()
+            audioEngine.inputNode.removeTap(onBus: 0)
+            activeTranscriptionSession?.cancel()
+
+            if error is CancellationError {
+                print("🎙️ BuddyDictationManager: start cancelled during session start")
+                resetSessionState()
+                return
+            }
+
             lastErrorMessage = userFacingErrorMessage(
                 from: error,
                 fallback: "couldn't start voice input. try again."
@@ -546,10 +569,43 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         self.activeTranscriptionSession = activeTranscriptionSession
         print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
 
-        let inputNode = audioEngine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
+        // A shortcut release while the provider was opening cancels this start.
+        // Bail before touching the audio engine, otherwise we leave a running
+        // engine and an installed tap behind for the next press to reconfigure
+        // mid-flight, which is what produced the repeated device-change cycles.
+        guard !Task.isCancelled else { throw CancellationError() }
 
+        let inputNode = audioEngine.inputNode
+
+        // Tear the graph fully down before re-routing. A previous session that
+        // failed part-way can leave the engine running, and changing the input
+        // device on a live graph is exactly what leaves a configuration change
+        // pending.
+        audioEngine.stop()
+        audioEngine.reset()
         inputNode.removeTap(onBus: 0)
+
+        // FAIL-SAFE best-effort device routing. If it fails we log and continue on
+        // the system default — this must NEVER abort the session. We skip the
+        // switch entirely when the node is already on the wanted device so a
+        // normal press does not churn the graph at all.
+        if let deviceID = AudioInputDevice.deviceID(forUID: targetMicrophoneUID) ?? AudioInputDevice.defaultInputDeviceID(),
+           inputNode.auAudioUnit.deviceID != deviceID {
+            await switchInputDeviceAndWaitForConfigurationChange(to: deviceID, on: inputNode)
+        }
+
+        // Read the format only after the device switch has landed. Reading it
+        // earlier returns the previous device's sample rate, and installTap then
+        // traps on the mismatch inside Objective-C where Swift cannot catch it.
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            throw NSError(
+                domain: "BuddyDictationManager",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "microphone isn't ready. try again."]
+            )
+        }
+
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
             self?.activeTranscriptionSession?.appendAudioBuffer(buffer)
             self?.updateAudioPowerLevel(from: buffer)
@@ -557,6 +613,57 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
         audioEngine.prepare()
         try audioEngine.start()
+    }
+
+    /// Switching the input device marks a configuration change as pending inside
+    /// AVAudioEngine, and the engine only clears that flag once it has processed
+    /// the change on a later run-loop turn. Installing a tap in the meantime fails
+    /// with "AVAudioEngineGraph.mm: Failed to create tap, config change pending!"
+    /// and the engine stops itself right after starting, so no audio ever reaches
+    /// the transcription provider.
+    ///
+    /// We register the observer before the switch so the notification cannot be
+    /// missed, and cap the wait so a device that never posts one still lets
+    /// recording continue instead of hanging the UI in "processing".
+    private func switchInputDeviceAndWaitForConfigurationChange(
+        to deviceID: AudioDeviceID,
+        on inputNode: AVAudioInputNode
+    ) async {
+        await withCheckedContinuation { continuation in
+            var hasResumedContinuation = false
+            var configurationChangeObserver: NSObjectProtocol? = nil
+
+            let finishWaiting = {
+                guard !hasResumedContinuation else { return }
+                hasResumedContinuation = true
+
+                if let configurationChangeObserver {
+                    NotificationCenter.default.removeObserver(configurationChangeObserver)
+                }
+
+                continuation.resume()
+            }
+
+            configurationChangeObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange,
+                object: audioEngine,
+                queue: .main
+            ) { _ in
+                finishWaiting()
+            }
+
+            do {
+                try inputNode.auAudioUnit.setDeviceID(deviceID)
+            } catch {
+                print("🎙️ mic route failed, using system default: \(error)")
+                finishWaiting()
+                return
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                finishWaiting()
+            }
+        }
     }
 
     private func handleRecognitionError(_ error: Error) {
@@ -628,6 +735,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
     private func resetSessionState() {
         pendingStartRequestIdentifier = UUID()
+        // Every failure path routes through here. A fallback still armed from a
+        // key-up would re-enter finalization on an already-reset session, so it
+        // has to die with the session.
+        finalizeFallbackWorkItem?.cancel()
+        finalizeFallbackWorkItem = nil
         activeTranscriptionSession = nil
         draftCallbacks = nil
         activeStartSource = nil

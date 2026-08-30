@@ -69,7 +69,7 @@ enum ClickyAnalytics {
 
     // MARK: - Voice Interaction
 
-    /// User pressed the push-to-talk shortcut (control+option) to start talking.
+    /// User pressed the push-to-talk shortcut (control+cmd) to start talking.
     static func trackPushToTalkStarted() {
         PostHogSDK.shared.capture("push_to_talk_started")
     }
