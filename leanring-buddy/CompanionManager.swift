@@ -126,6 +126,7 @@ final class CompanionManager: ObservableObject {
     /// sentences from continuing to play while the user speaks again.
     private var ttsGeneration = UUID()
     private var speechChain: Task<Void, Never>?
+    private var firstSpeechStartTask: Task<Void, Never>?
     private var speechFlushTask: Task<Void, Never>?
     private var didStartSpeaking = false
 
@@ -134,6 +135,8 @@ final class CompanionManager: ObservableObject {
         ttsGeneration = UUID()
         speechChain?.cancel()
         speechChain = nil
+        firstSpeechStartTask?.cancel()
+        firstSpeechStartTask = nil
         speechFlushTask?.cancel()
         speechFlushTask = nil
         streamedSpeechBuffer = ""
@@ -148,10 +151,17 @@ final class CompanionManager: ObservableObject {
     private func handleStreamedTextChunk(_ chunk: String) {
         streamedSpeechBuffer += chunk
         while let (sentence, remainder) = Self.popFirstCompleteSentence(from: streamedSpeechBuffer) {
+            firstSpeechStartTask?.cancel()
+            firstSpeechStartTask = nil
             enqueueSpokenSentence(sentence)
             streamedSpeechBuffer = remainder
         }
-        
+
+        if !didStartSpeaking {
+            scheduleFirstSpokenFragment()
+            return
+        }
+
         speechFlushTask?.cancel()
         let currentGen = ttsGeneration
         speechFlushTask = Task { @MainActor [weak self] in
@@ -170,6 +180,38 @@ final class CompanionManager: ObservableObject {
                     self.streamedSpeechBuffer = ""
                 }
             }
+        }
+    }
+
+    /// Starts synthesis from the first streamed phrase on a fixed short timer.
+    /// Unlike the later idle flush, this does not restart for every new token,
+    /// so a fast continuous stream does not defer Pauline's first spoken words.
+    private func scheduleFirstSpokenFragment() {
+        guard firstSpeechStartTask == nil else { return }
+
+        let currentGeneration = ttsGeneration
+        firstSpeechStartTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            guard !Task.isCancelled,
+                  let self,
+                  self.ttsGeneration == currentGeneration,
+                  !self.didStartSpeaking else { return }
+
+            self.firstSpeechStartTask = nil
+            let buffer = self.streamedSpeechBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !buffer.isEmpty,
+                  !buffer.contains("[POINT:"),
+                  !buffer.contains("[RUN:"),
+                  !buffer.contains("[ASK:") else { return }
+
+            let stripped = buffer.replacingOccurrences(of: #"\[POINT:[^\]]*\]"#, with: "", options: .regularExpression)
+                                 .replacingOccurrences(of: #"\[RUN:[^\]]*\]"#, with: "", options: .regularExpression)
+                                 .replacingOccurrences(of: #"\[ASK:[^\]]*\]"#, with: "", options: .regularExpression)
+                                 .replacingOccurrences(of: #"\[LEARN:[^\]]*\]"#, with: "", options: .regularExpression)
+            guard !stripped.isEmpty else { return }
+
+            self.enqueueSpokenSentence(stripped)
+            self.streamedSpeechBuffer = ""
         }
     }
 
