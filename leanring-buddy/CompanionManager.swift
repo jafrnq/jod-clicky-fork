@@ -94,10 +94,19 @@ final class CompanionManager: ObservableObject {
     /// Routes an utterance to the selected TTS engine: Edge neural voice when
     /// chosen and available, Apple AVSpeechSynthesizer otherwise.
     private func speakViaTTS(_ text: String) async throws {
-        if let edgeVoice = selectedEdgeVoiceID, EdgeTTSClient.isAvailable {
-            try await edgeTTS.speakText(text, voice: edgeVoice)
-        } else {
-            try await appleTTS.speakText(text)
+        do {
+            if let edgeVoice = selectedEdgeVoiceID, EdgeTTSClient.isAvailable {
+                try await edgeTTS.speakText(text, voice: edgeVoice)
+            } else {
+                try await appleTTS.speakText(text)
+            }
+        } catch {
+            print("⚠️ TTS failed: \(error), retrying with AppleTTS")
+            do {
+                try await appleTTS.speakText(text)
+            } catch {
+                print("⚠️ AppleTTS fallback failed: \(error)")
+            }
         }
     }
 
@@ -286,6 +295,20 @@ final class CompanionManager: ObservableObject {
 
     /// The Claude model used for voice responses. Persisted to UserDefaults.
     @Published var selectedModel: String = UserDefaults.standard.string(forKey: "selectedClaudeModel") ?? "claude-sonnet-4-6"
+    @Published var selectedCodexModel: String = UserDefaults.standard.string(forKey: "codexModel") ?? "gpt-5.4-mini"
+    @Published private(set) var codexModelCatalogState: AgentModelCatalogState = .notLoaded
+    @Published private(set) var codexAccountStatus: CodexAccountStatus = .notAuthenticated
+    
+    @Published private(set) var selectedReasoningEffort: String = "high"
+    @Published private(set) var availableReasoningOptions: [AgentReasoningOption] = []
+    
+    @Published var paulineCursorColorHex: String = UserDefaults.standard.string(forKey: "paulineCursorColorHex") ?? "#3380FF"
+    @Published var paulineCursorShape: String = UserDefaults.standard.string(forKey: "paulineCursorShape") ?? "circle"
+    
+    private var paulineReasoningEffortByModel: [String: String] {
+        get { UserDefaults.standard.dictionary(forKey: "paulineReasoningEffortByModel") as? [String: String] ?? [:] }
+        set { UserDefaults.standard.set(newValue, forKey: "paulineReasoningEffortByModel") }
+    }
     @Published var selectedMicrophoneUID: String = UserDefaults.standard.string(forKey: "selectedMicrophoneUID") ?? ""
     @Published private(set) var availableMicrophones: [AudioInputDevice] = []
 
@@ -299,9 +322,80 @@ final class CompanionManager: ObservableObject {
         availableMicrophones = AudioInputDevice.fetchAvailableDevices()
     }
 
+        func setCursorColor(_ hex: String) {
+        paulineCursorColorHex = hex
+        UserDefaults.standard.set(hex, forKey: "paulineCursorColorHex")
+    }
+    func setCursorShape(_ shape: String) {
+        paulineCursorShape = shape
+        UserDefaults.standard.set(shape, forKey: "paulineCursorShape")
+    }
+
+    func setSelectedCodexModel(_ model: String) {
+        selectedCodexModel = model
+        UserDefaults.standard.set(model, forKey: "codexModel")
+        resolveCurrentReasoning()
+    }
+    
+    func setSelectedReasoningEffort(_ effort: String) {
+        guard availableReasoningOptions.contains(where: { $0.value == effort }) else { return }
+        selectedReasoningEffort = effort
+        let key = "\(selectedBackend):\(selectedBackend == "claude" ? selectedModel : selectedCodexModel)"
+        var dict = paulineReasoningEffortByModel
+        dict[key] = effort
+        paulineReasoningEffortByModel = dict
+        applyReasoningToBackend()
+    }
+    
+    private func resolveCurrentReasoning() {
+        let key = "\(selectedBackend):\(selectedBackend == "claude" ? selectedModel : selectedCodexModel)"
+        let saved = paulineReasoningEffortByModel[key]
+        
+        if selectedBackend == "claude" {
+            let claudeModel = AgentModelCatalog.claudeModels.first(where: { $0.id == selectedModel }) ?? AgentModelCatalog.claudeModels[0]
+            availableReasoningOptions = claudeModel.supportedReasoningEfforts
+            selectedReasoningEffort = AgentModelCatalog.resolveEffort(saved: saved, for: claudeModel)
+            applyReasoningToBackend()
+        } else {
+            guard case .loaded(let options) = codexModelCatalogState else { return }
+            guard let codexModel = options.first(where: { $0.id == selectedCodexModel }) ?? options.first(where: { $0.isDefault }) ?? options.first else { return }
+            if codexModel.id != selectedCodexModel {
+                setSelectedCodexModel(codexModel.id)
+                return
+            }
+            availableReasoningOptions = codexModel.supportedReasoningEfforts
+            selectedReasoningEffort = AgentModelCatalog.resolveEffort(saved: saved, for: codexModel)
+            applyReasoningToBackend()
+        }
+    }
+    
+    private func applyReasoningToBackend() {
+        if selectedBackend == "claude" {
+            claudeAgentSDK.reasoningEffort = selectedReasoningEffort
+        } else {
+            codexAgentSDK.applyConfiguration(model: selectedCodexModel, reasoningEffort: selectedReasoningEffort)
+        }
+    }
+    
+    func refreshCodexModelCatalog() {
+        codexModelCatalogState = .loading
+        Task { @MainActor [weak self] in
+            guard let self = self else { return }
+            self.codexAccountStatus = await self.codexAgentSDK.readAccountStatus()
+            do {
+                let models = try await self.codexAgentSDK.listAvailableModels()
+                self.codexModelCatalogState = .loaded(models)
+                self.resolveCurrentReasoning()
+            } catch {
+                self.codexModelCatalogState = .unavailable(reason: "Couldn't read models")
+            }
+        }
+    }
+
     func setSelectedModel(_ model: String) {
         selectedModel = model
         UserDefaults.standard.set(model, forKey: "selectedClaudeModel")
+        resolveCurrentReasoning()
         claudeAgentSDK.model = model
     }
     
@@ -344,6 +438,7 @@ final class CompanionManager: ObservableObject {
         let valid = backend == "codex" ? "codex" : "claude"
         selectedBackend = valid
         UserDefaults.standard.set(valid, forKey: "clickyBackend")
+        resolveCurrentReasoning()
     }
     private lazy var codexAgentSDK: CodexAgentSDKAPI = CodexAgentSDKAPI()
     
@@ -427,6 +522,33 @@ final class CompanionManager: ObservableObject {
     }
 
     func start() {
+        if !UserDefaults.standard.bool(forKey: "paulineEmmaDefaultApplied") {
+            UserDefaults.standard.set(true, forKey: "paulineEmmaDefaultApplied")
+            if selectedVoiceIdentifier == nil {
+                if EdgeTTSClient.isAvailable {
+                    setSelectedVoiceIdentifier("edge:\(EdgeTTSClient.defaultVoiceID)")
+                } else if let appleVoice = AppleTTSClient.availableEnglishVoices().first {
+                    setSelectedVoiceIdentifier(appleVoice.identifier)
+                }
+            }
+        } else if let voiceId = selectedVoiceIdentifier {
+            if voiceId.hasPrefix("edge:") {
+                if !EdgeTTSClient.availableVoices().contains(where: { $0.id == voiceId }) {
+                    setSelectedVoiceIdentifier(EdgeTTSClient.isAvailable ? "edge:\(EdgeTTSClient.defaultVoiceID)" : nil)
+                }
+            } else {
+                if !AppleTTSClient.availableEnglishVoices().contains(where: { $0.identifier == voiceId }) {
+                    setSelectedVoiceIdentifier(EdgeTTSClient.isAvailable ? "edge:\(EdgeTTSClient.defaultVoiceID)" : nil)
+                }
+            }
+        } else {
+            if EdgeTTSClient.isAvailable {
+                setSelectedVoiceIdentifier("edge:\(EdgeTTSClient.defaultVoiceID)")
+            }
+        }
+        
+        resolveCurrentReasoning()
+        refreshCodexModelCatalog()
         if UserDefaults.standard.object(forKey: "clickyMuteOnControlCmd") != nil {
             var defaultOutputDeviceID = kAudioObjectUnknown
             var propertyAddress = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
@@ -870,11 +992,23 @@ final class CompanionManager: ObservableObject {
             // Cancel the pending start task in case the user released the shortcut
             // before the async startPushToTalk had a chance to begin recording.
             // Without this, a quick press-and-release drops the release event and
-            // leaves the waveform overlay stuck on screen indefinitely.
-            ClickyAnalytics.trackPushToTalkReleased()
+            // leaves the waveform overlay stuck on screen indefinitely. This must
+            // run unconditionally, before the guard below — it's what unwinds a
+            // start that's still in flight and hasn't set isDictationInProgress yet.
             pendingKeyboardShortcutStartTask?.cancel()
             pendingKeyboardShortcutStartTask = nil
-            
+
+            // A release with nothing in progress and nothing just cancelled isn't
+            // a real press-release cycle — e.g. the app launched while the
+            // shortcut was already held down, so the monitor's first release
+            // fires with no session behind it. Without this guard we'd still
+            // spin up a screen-capture task below that lingers unconsumed until
+            // the *next* real utterance, which then gets answered against a
+            // screenshot taken at this phantom release.
+            guard buddyDictationManager.isDictationInProgress else { return }
+
+            ClickyAnalytics.trackPushToTalkReleased()
+
             Task { @MainActor in
                 RegionSelectionOverlayManager.shared.cancelSelection()
                 let regionToCapture = RegionSelectionOverlayManager.shared.takeLastCompletedRect() ?? self.pendingRegionSelection
@@ -883,11 +1017,10 @@ final class CompanionManager: ObservableObject {
                     if let region = regionToCapture {
                         return [try await CompanionScreenCaptureUtility.captureRegionAsJPEG(globalRect: region)]
                     } else {
-                        return try await CompanionScreenCaptureUtility.captureFocusedDisplayAsJPEG()
+                        return try await CompanionScreenCaptureUtility.captureFocusedWindowAsJPEG()
                     }
                 }
             }
-            
             buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
         case .none:
             break
@@ -932,6 +1065,7 @@ final class CompanionManager: ObservableObject {
         - answer the question, then stop. no follow-up questions, no suggestions, no "you could also".
         - never say "simply" or "just". don't read code verbatim.
         - write for the ear. spell out small numbers.
+        - you usually only see the frontmost app's focused window. you cannot see the menu bar, Dock, or other apps unless a region is explicitly selected.
         - if you receive multiple screen images, the one labeled "primary focus" is where the cursor is — prioritize that one but reference others if relevant.
         """
         
@@ -995,14 +1129,19 @@ final class CompanionManager: ObservableObject {
             voiceState = .processing
 
             do {
-                // Capture all connected screens so the AI has full context
                 let screenCaptures: [CompanionScreenCapture]
-                if let captureTask = pendingScreenCaptureTask {
-                    screenCaptures = try await captureTask.value
-                } else {
-                    screenCaptures = try await CompanionScreenCaptureUtility.captureFocusedDisplayAsJPEG()
+                defer { self.pendingScreenCaptureTask = nil }
+                do {
+                    if let captureTask = pendingScreenCaptureTask {
+                        screenCaptures = try await captureTask.value
+                    } else {
+                        screenCaptures = try await CompanionScreenCaptureUtility.captureFocusedWindowAsJPEG()
+                    }
+                } catch CompanionScreenCaptureError.noFocusedWindow, CompanionScreenCaptureError.windowCaptureFailed {
+                    Task { try? await self.speakViaTTS("i can't see a focused window right now") }
+                    self.resetSpeechPipeline()
+                    return
                 }
-                pendingScreenCaptureTask = nil
 
                 guard !Task.isCancelled else { return }
 

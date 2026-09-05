@@ -116,6 +116,22 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         if eventType == .tapDisabledByTimeout || eventType == .tapDisabledByUserInput {
             if let globalEventTap {
                 CGEvent.tapEnable(tap: globalEventTap, enable: true)
+
+                let currentFlags = CGEventSource.flagsState(.combinedSessionState)
+                let transition = BuddyPushToTalkShortcut.shortcutTransition(
+                    for: .flagsChanged,
+                    keyCode: 0,
+                    modifierFlagsRawValue: currentFlags.rawValue,
+                    wasShortcutPreviouslyPressed: isShortcutCurrentlyPressed
+                )
+
+                if transition == .released {
+                    isShortcutCurrentlyPressed = false
+                    shortcutTransitionPublisher.send(.released)
+                } else if transition == .pressed {
+                    isShortcutCurrentlyPressed = true
+                    shortcutTransitionPublisher.send(.pressed)
+                }
             }
             return Unmanaged.passUnretained(event)
         }

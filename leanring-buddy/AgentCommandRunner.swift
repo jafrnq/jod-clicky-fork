@@ -25,7 +25,7 @@ import Darwin
     static func askUserToApprove(command: String) -> Bool {
         NSApp.activate(ignoringOtherApps: true)
         let alert = NSAlert()
-        alert.messageText = "Clicky wants to confirm"
+        alert.messageText = "Pauline wants to confirm"
         alert.informativeText = command
         alert.addButton(withTitle: "Cancel")   // FIRST = default = safe
         alert.addButton(withTitle: "Run")

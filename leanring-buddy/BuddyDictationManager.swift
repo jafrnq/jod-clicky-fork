@@ -289,12 +289,24 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// Timestamp of the last completed permission request, used to debounce
     /// rapid follow-up requests that arrive before macOS updates its cache.
     private var lastPermissionRequestCompletedAt: Date?
+    /// Bumped every time a session starts or tears down. Async provider
+    /// callbacks and the finalize fallback capture this at creation time and
+    /// compare against the live value before acting, so a callback from a
+    /// session that already ended cannot finalize, mutate, or kill whatever
+    /// session is live now.
+    private var activeDictationSessionGeneration: UInt64 = 0
+    /// Suppresses the persistent configuration-change observer while we are
+    /// deliberately re-routing the input device ourselves. Without this, the
+    /// observer reacts to our own device switch mid-start and reinstalls a
+    /// tap while `startRecognitionSession` is already installing one.
+    private var isReconfiguringAudioGraph = false
 
     override init() {
         let transcriptionProvider = BuddyTranscriptionProviderFactory.makeDefaultProvider()
         self.transcriptionProvider = transcriptionProvider
         self.transcriptionProviderDisplayName = transcriptionProvider.displayName
         super.init()
+        registerPersistentConfigurationChangeObserver()
     }
 
     func updateContextualKeyterms(_ contextualKeyterms: [String]) {
@@ -352,8 +364,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             draftCallbacks?.updateDraftText(currentDraftText)
         }
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
+        stopAudioCapture()
         activeTranscriptionSession?.cancel()
 
         resetSessionState()
@@ -430,6 +441,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             return
         }
 
+        activeDictationSessionGeneration += 1
         draftTextBeforeCurrentDictation = currentDraftText
         latestRecognizedText = ""
         draftCallbacks = BuddyDictationDraftCallbacks(
@@ -461,8 +473,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             try await startRecognitionSession()
             guard !Task.isCancelled else {
                 print("🎙️ BuddyDictationManager: start cancelled (shortcut released during session start)")
-                audioEngine.stop()
-                audioEngine.inputNode.removeTap(onBus: 0)
+                stopAudioCapture()
                 activeTranscriptionSession?.cancel()
                 resetSessionState()
                 return
@@ -477,8 +488,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             // behind. Tear it down here so the next press starts from a clean
             // graph instead of re-routing a live one.
             isPreparingToRecord = false
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
+            stopAudioCapture()
             activeTranscriptionSession?.cancel()
 
             if error is CancellationError {
@@ -514,15 +524,20 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         let finalTranscriptFallbackDelaySeconds = activeTranscriptionSession?.finalTranscriptFallbackDelaySeconds
             ?? Self.defaultFinalTranscriptFallbackDelaySeconds
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
+        stopAudioCapture()
         activeTranscriptionSession?.requestFinalTranscript()
 
         finalizeFallbackWorkItem?.cancel()
         let shouldSubmitFinalDraftWhenFallbackTriggers = shouldAutomaticallySubmitFinalDraft
+        // Captured now so the fallback can tell whether it still belongs to
+        // this session by the time it actually fires. DispatchWorkItem.cancel()
+        // cannot stop the Task once this closure body has already started
+        // running, so the generation check inside is the real guard.
+        let fallbackSessionGeneration = activeDictationSessionGeneration
         let fallbackWorkItem = DispatchWorkItem { [weak self] in
             Task { @MainActor in
-                self?.finishCurrentDictationSessionIfNeeded(
+                guard let self, fallbackSessionGeneration == self.activeDictationSessionGeneration else { return }
+                self.finishCurrentDictationSessionIfNeeded(
                     shouldSubmitFinalDraft: shouldSubmitFinalDraftWhenFallbackTriggers
                 )
             }
@@ -535,21 +550,33 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private func startRecognitionSession() async throws {
+        // Suppress the persistent configuration-change observer for the
+        // duration of our own device routing below — see its declaration.
+        isReconfiguringAudioGraph = true
+        defer { isReconfiguringAudioGraph = false }
+
         activeTranscriptionSession?.cancel()
         activeTranscriptionSession = nil
 
         print("🎙️ BuddyDictationManager: opening transcription provider \(transcriptionProvider.displayName)")
 
+        // Captured once here and compared against the live value inside every
+        // callback below, so a callback delivered after this session has
+        // already ended (cancelled, reset, superseded by a new press) cannot
+        // act on whatever session is live by the time it runs.
+        let sessionGeneration = activeDictationSessionGeneration
+
         let activeTranscriptionSession = try await transcriptionProvider.startStreamingSession(
             keyterms: buildTranscriptionKeyterms(),
             onTranscriptUpdate: { [weak self] transcriptText in
                 Task { @MainActor in
-                    self?.latestRecognizedText = transcriptText
+                    guard let self, sessionGeneration == self.activeDictationSessionGeneration else { return }
+                    self.latestRecognizedText = transcriptText
                 }
             },
             onFinalTranscriptReady: { [weak self] transcriptText in
                 Task { @MainActor in
-                    guard let self else { return }
+                    guard let self, sessionGeneration == self.activeDictationSessionGeneration else { return }
                     self.latestRecognizedText = transcriptText
 
                     if self.isFinalizingTranscript {
@@ -561,7 +588,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             },
             onError: { [weak self] error in
                 Task { @MainActor in
-                    self?.handleRecognitionError(error)
+                    guard let self, sessionGeneration == self.activeDictationSessionGeneration else { return }
+                    self.handleRecognitionError(error)
                 }
             }
         )
@@ -606,13 +634,22 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             )
         }
 
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.activeTranscriptionSession?.appendAudioBuffer(buffer)
-            self?.updateAudioPowerLevel(from: buffer)
-        }
+        installAudioTap(on: inputNode, format: inputFormat)
 
         audioEngine.prepare()
         try audioEngine.start()
+    }
+
+    private func installAudioTap(on inputNode: AVAudioInputNode, format: AVAudioFormat) {
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            self?.activeTranscriptionSession?.appendAudioBuffer(buffer)
+            self?.updateAudioPowerLevel(from: buffer)
+        }
+    }
+
+    private func stopAudioCapture() {
+        audioEngine.stop()
+        audioEngine.inputNode.removeTap(onBus: 0)
     }
 
     /// Switching the input device marks a configuration change as pending inside
@@ -666,6 +703,56 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
     }
 
+    /// The device-switch observer above only exists for the duration of a
+    /// switch we initiated ourselves. A config change that arrives at any
+    /// other time — the active microphone is unplugged mid-recording, or
+    /// macOS changes the default device out from under us — has no handler
+    /// anywhere else in this class: AVAudioEngine stops itself and drops the
+    /// tap, and the session would otherwise limp along recording nothing
+    /// until the finalize fallback fires with whatever partial transcript
+    /// had already arrived. This observer is registered once for the
+    /// manager's lifetime and attempts to reinstall the tap and restart on
+    /// whatever device is now current, so the session survives instead.
+    private func registerPersistentConfigurationChangeObserver() {
+        NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: audioEngine,
+            queue: .main
+        ) { [weak self] _ in
+            self?.recoverFromUnexpectedConfigurationChange()
+        }
+    }
+
+    private func recoverFromUnexpectedConfigurationChange() {
+        guard !isReconfiguringAudioGraph else { return }
+        guard isActivelyRecordingAudio, activeTranscriptionSession != nil else { return }
+
+        print("🎙️ BuddyDictationManager: unexpected audio configuration change mid-session, attempting recovery")
+
+        let inputNode = audioEngine.inputNode
+        inputNode.removeTap(onBus: 0)
+
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+            lastErrorMessage = "microphone disconnected. try again."
+            cancelCurrentDictation(preserveDraftText: false)
+            return
+        }
+
+        installAudioTap(on: inputNode, format: inputFormat)
+
+        guard !audioEngine.isRunning else { return }
+
+        audioEngine.prepare()
+        do {
+            try audioEngine.start()
+        } catch {
+            print("❌ BuddyDictationManager: failed to restart engine after configuration change: \(error)")
+            lastErrorMessage = "microphone disconnected. try again."
+            cancelCurrentDictation(preserveDraftText: false)
+        }
+    }
+
     private func handleRecognitionError(_ error: Error) {
         if hasFinishedCurrentDictationSession {
             return
@@ -700,8 +787,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             currentDraftCallbacks?.updateDraftText(finalDraftText)
         }
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
+        stopAudioCapture()
         activeTranscriptionSession?.cancel()
 
         resetSessionState()
@@ -734,6 +820,12 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private func resetSessionState() {
+        // Every teardown path routes through here, including cancel/finish
+        // paths that don't immediately start a replacement session. Bumping
+        // here (in addition to session start) means a late callback captured
+        // before this reset is invalidated even if no new session has begun
+        // yet — the generation moves regardless of whether anything replaces it.
+        activeDictationSessionGeneration += 1
         pendingStartRequestIdentifier = UUID()
         // Every failure path routes through here. A fallback still armed from a
         // key-up would re-enter finalization on an already-reset session, so it

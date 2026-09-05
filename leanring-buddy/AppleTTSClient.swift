@@ -15,10 +15,17 @@ public class AppleTTSClient: NSObject, AVSpeechSynthesizerDelegate {
     
     public static let selectedVoiceIdentifierDefaultsKey = "clickyVoiceIdentifier"
     
-    public static func availableEnglishVoices() -> [AVSpeechSynthesisVoice] {
-        return AVSpeechSynthesisVoice.speechVoices()
+    /// Resolved once. `AVSpeechSynthesisVoice.speechVoices()` makes a synchronous
+    /// TextToSpeech/AX hop on macOS 27, so calling it from a SwiftUI body (the voice
+    /// picker) can block the main thread. Cache it and prime it off-main at startup.
+    private static let cachedEnglishVoices: [AVSpeechSynthesisVoice] = {
+        AVSpeechSynthesisVoice.speechVoices()
             .filter { $0.language.hasPrefix("en") }
             .sorted { $0.name < $1.name }
+    }()
+
+    public static func availableEnglishVoices() -> [AVSpeechSynthesisVoice] {
+        cachedEnglishVoices
     }
     
     private static func selectedSystemVoice() -> AVSpeechSynthesisVoice? {

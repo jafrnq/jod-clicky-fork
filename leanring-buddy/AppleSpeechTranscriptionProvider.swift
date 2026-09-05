@@ -60,6 +60,7 @@ final class AppleSpeechTranscriptionProvider: BuddyTranscriptionProvider {
 private final class AppleSpeechTranscriptionSession: NSObject, BuddyStreamingTranscriptionSession {
     let finalTranscriptFallbackDelaySeconds: TimeInterval = 1.8
 
+    private let speechRecognizer: SFSpeechRecognizer
     private let recognitionRequest: SFSpeechAudioBufferRecognitionRequest
     private var recognitionTask: SFSpeechRecognitionTask?
     private let onTranscriptUpdate: (String) -> Void
@@ -76,6 +77,7 @@ private final class AppleSpeechTranscriptionSession: NSObject, BuddyStreamingTra
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void
     ) throws {
+        self.speechRecognizer = speechRecognizer
         self.recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
         self.onTranscriptUpdate = onTranscriptUpdate
         self.onFinalTranscriptReady = onFinalTranscriptReady

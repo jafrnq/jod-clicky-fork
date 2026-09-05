@@ -11,7 +11,7 @@ import Darwin
 import Foundation
 
 @MainActor
-final class ClaudeAgentSDKAPI {
+final class ClaudeAgentSDKAPI: AgentBackend {
     private typealias ResponseContinuation = CheckedContinuation<(text: String, duration: TimeInterval), Error>
 
     private struct PendingRequest {

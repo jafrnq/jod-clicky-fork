@@ -10,6 +10,16 @@
 import AVFoundation
 import SwiftUI
 
+extension CGColor {
+    func toHex() -> String? {
+        guard let components = components, components.count >= 3 else { return nil }
+        let r = Float(components[0])
+        let g = Float(components[1])
+        let b = Float(components[2])
+        return String(format: "#%02lX%02lX%02lX", lroundf(r * 255), lroundf(g * 255), lroundf(b * 255))
+    }
+}
+
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
     @State private var emailInput: String = ""
@@ -31,8 +41,19 @@ struct CompanionPanelView: View {
 
                 backendPickerRow
                     .padding(.horizontal, 16)
-                    
+                
+                if companionManager.selectedBackend == "codex" {
+                    codexStatusRow
+                        .padding(.horizontal, 16)
+                }
+
                 modelPickerRow
+                    .padding(.horizontal, 16)
+                
+                reasoningPickerRow
+                    .padding(.horizontal, 16)
+                
+                cursorAppearanceRow
                     .padding(.horizontal, 16)
                 
                 voicePickerRow
@@ -117,7 +138,7 @@ struct CompanionPanelView: View {
                     .frame(width: 8, height: 8)
                     .shadow(color: statusDotColor.opacity(0.6), radius: 4)
 
-                Text("Clicky")
+                Text("Pauline")
                     .font(.system(size: 14, weight: .semibold))
                     .foregroundColor(DS.Colors.textPrimary)
             }
@@ -704,6 +725,174 @@ struct CompanionPanelView: View {
         let isSelected = companionManager.selectedModel == modelID
         return Button(action: {
             companionManager.setSelectedModel(modelID)
+        }) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
+    // MARK: - Codex Status
+    
+    private var codexStatusRow: some View {
+        let isConnected: Bool
+        let statusText: String
+        switch companionManager.codexAccountStatus {
+        case .ready:
+            isConnected = true
+            statusText = "Connected"
+        case .notAuthenticated:
+            isConnected = false
+            statusText = "Not Authenticated"
+        case .notInstalled:
+            isConnected = false
+            statusText = "Not Installed"
+        case .failed:
+            isConnected = false
+            statusText = "Failed"
+        }
+        
+        return HStack {
+            Text("Codex Account")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+                
+            Spacer()
+            
+            HStack(spacing: 6) {
+                Circle()
+                    .fill(isConnected ? DS.Colors.success : DS.Colors.warning)
+                    .frame(width: 6, height: 6)
+                Text(statusText)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(isConnected ? DS.Colors.success : DS.Colors.warning)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Reasoning Picker
+    
+    private var reasoningPickerRow: some View {
+        HStack {
+            Text("Reasoning")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Spacer()
+
+            if companionManager.availableReasoningOptions.isEmpty {
+                Text("N/A")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+            } else {
+                HStack(spacing: 0) {
+                    ForEach(companionManager.availableReasoningOptions, id: \.value) { option in
+                        reasoningOptionButton(label: option.displayName, value: option.value)
+                    }
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+            }
+        }
+        .padding(.vertical, 4)
+    }
+    
+    private func reasoningOptionButton(label: String, value: String) -> some View {
+        let isSelected = companionManager.selectedReasoningEffort == value
+        return Button(action: {
+            companionManager.setSelectedReasoningEffort(value)
+        }) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
+    // MARK: - Cursor Appearance
+    
+    private var cursorAppearanceRow: some View {
+        VStack(spacing: 8) {
+            HStack {
+                Text("Cursor Color")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer()
+                ColorPicker("", selection: Binding(
+                    get: {
+                        let hex = companionManager.paulineCursorColorHex.trimmingCharacters(in: .whitespacesAndNewlines)
+                        var hexSanitized = hex
+                        if hex.hasPrefix("#") {
+                            hexSanitized = String(hex.dropFirst())
+                        }
+                        if let hexNum = UInt32(hexSanitized, radix: 16) {
+                            let r = Double((hexNum & 0xFF0000) >> 16) / 255.0
+                            let g = Double((hexNum & 0x00FF00) >> 8) / 255.0
+                            let b = Double(hexNum & 0x0000FF) / 255.0
+                            return Color(red: r, green: g, blue: b)
+                        }
+                        return DS.Colors.overlayCursorBlue
+                    },
+                    set: { color in
+                        if let cgColor = color.cgColor, let hex = cgColor.toHex() {
+                            companionManager.setCursorColor(hex)
+                        }
+                    }
+                ))
+                .labelsHidden()
+            }
+            
+            HStack {
+                Text("Cursor Shape")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer()
+                HStack(spacing: 0) {
+                    shapeOptionButton(label: "Circle", shape: "circle")
+                    shapeOptionButton(label: "Square", shape: "square")
+                    shapeOptionButton(label: "Hexagon", shape: "hexagon")
+                }
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.white.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                )
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func shapeOptionButton(label: String, shape: String) -> some View {
+        let isSelected = companionManager.paulineCursorShape == shape
+        return Button(action: {
+            companionManager.setCursorShape(shape)
         }) {
             Text(label)
                 .font(.system(size: 11, weight: .medium))

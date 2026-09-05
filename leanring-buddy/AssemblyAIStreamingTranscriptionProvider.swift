@@ -130,6 +130,11 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var hasResolvedReadyContinuation = false
     private var hasDeliveredFinalTranscript = false
+    /// Set by `cancel()`. Once true, `failSession` must not deliver a partial
+    /// transcript or an error — the caller has already discarded this session
+    /// and moved on, so either callback would land on whatever session is
+    /// live now instead of the one that owned them.
+    private var hasBeenCancelled = false
     private var isAwaitingExplicitFinalTranscript = false
     private var latestTranscriptText = ""
     private var activeTurnOrder: Int?
@@ -207,6 +212,13 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
 
     func cancel() {
         stateQueue.async {
+            // Mark this session as done before the socket teardown below has a
+            // chance to surface as a `failSession` call. Without this, a
+            // cancelled session's socket-close error can still deliver a
+            // partial transcript or an error to a caller who has already
+            // moved on to a different session.
+            self.hasBeenCancelled = true
+            self.hasDeliveredFinalTranscript = true
             self.explicitFinalTranscriptDeadlineWorkItem?.cancel()
             self.explicitFinalTranscriptDeadlineWorkItem = nil
         }
@@ -392,6 +404,8 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
     private func failSession(with error: Error) {
         resolveReadyContinuationIfNeeded(with: .failure(error))
         stateQueue.async {
+            guard !self.hasBeenCancelled else { return }
+
             let latestTranscriptText = self.bestAvailableTranscriptText()
 
             if self.isAwaitingExplicitFinalTranscript

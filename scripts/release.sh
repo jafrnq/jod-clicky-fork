@@ -35,6 +35,7 @@ export PATH="/opt/homebrew/bin:$PATH"
 
 SCHEME="leanring-buddy"
 APP_NAME="makesomething"
+APP_BUNDLE_NAME="Pauline"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${PROJECT_DIR}/build"
 ARCHIVE_PATH="${BUILD_DIR}/${APP_NAME}.xcarchive"
@@ -193,11 +194,11 @@ create-dmg \
     --window-pos 200 120 \
     --window-size 660 400 \
     --icon-size 100 \
-    --icon "${APP_NAME}.app" 160 195 \
+    --icon "${APP_BUNDLE_NAME}.app" 160 195 \
     --app-drop-link 500 195 \
     --background "${DMG_BACKGROUND}" \
     "${DMG_PATH}" \
-    "${EXPORT_DIR}/${APP_NAME}.app" \
+    "${EXPORT_DIR}/${APP_BUNDLE_NAME}.app" \
     2>&1 | tail -3
 
 echo "✅ DMG created: ${DMG_PATH}"

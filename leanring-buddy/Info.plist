@@ -5,13 +5,13 @@
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSAccessibilityUsageDescription</key>
-	<string>Clicky uses accessibility access to detect the push-to-talk shortcut.</string>
+	<string>Pauline uses accessibility access to detect the push-to-talk shortcut.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Clicky uses your microphone so you can talk to it</string>
+	<string>Pauline uses your microphone so you can talk to it</string>
 	<key>NSScreenCaptureUsageDescription</key>
-	<string>Clicky needs screen recording access to see your screen and help you.</string>
+	<string>Pauline needs screen recording access to see your screen and help you.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>Clicky uses speech recognition to transcribe your voice when you talk to it</string>
+	<string>Pauline uses speech recognition to transcribe your voice when you talk to it</string>
 	<key>SUFeedURL</key>
 	<string>https://raw.githubusercontent.com/julianjear/makesomething-mac-app/main/appcast.xml</string>
 	<key>SUPublicEDKey</key>

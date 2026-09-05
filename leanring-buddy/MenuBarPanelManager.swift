@@ -78,7 +78,7 @@ final class MenuBarPanelManager: NSObject {
 
         guard let button = statusItem?.button else { return }
 
-        button.image = makeClickyMenuBarIcon()
+        button.image = makePaulineMenuBarIcon()
         button.image?.isTemplate = true
         button.action = #selector(statusItemClicked)
         button.target = self
@@ -86,7 +86,7 @@ final class MenuBarPanelManager: NSObject {
 
     /// Draws the clicky triangle as a menu bar icon. Uses the same shape
     /// and rotation as the in-app cursor so the menu bar icon matches.
-    private func makeClickyMenuBarIcon() -> NSImage {
+    private func makePaulineMenuBarIcon() -> NSImage {
         let iconSize: CGFloat = 18
         let image = NSImage(size: NSSize(width: iconSize, height: iconSize))
         image.lockFocus()
@@ -149,6 +149,7 @@ final class MenuBarPanelManager: NSObject {
         panel?.makeKeyAndOrderFront(nil)
         panel?.orderFrontRegardless()
         installClickOutsideMonitor()
+        companionManager.panelDidAppear()
     }
 
     private func hidePanel() {

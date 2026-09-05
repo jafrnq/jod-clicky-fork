@@ -14,10 +14,10 @@ All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in th
 - **App Type**: Menu bar-only (`LSUIElement=true`), no dock icon or main window
 - **Framework**: SwiftUI (macOS native) with AppKit bridging for menu bar panel and cursor overlay
 - **Pattern**: MVVM with `@StateObject` / `@Published` state management
-- **AI Chat**: Claude (Sonnet 4.6 default, Opus 4.6 optional) via Cloudflare Worker proxy with SSE streaming
+- **AI Chat**: Selectable Claude or Codex backend. Claude uses the local Agent SDK bridge; Codex uses the local `codex app-server` over JSON-RPC with the user's ChatGPT subscription.
 - **Speech-to-Text**: AssemblyAI real-time streaming (`u3-rt-pro` model) via websocket, with OpenAI and Apple Speech as fallbacks
 - **Text-to-Speech**: ElevenLabs (`eleven_flash_v2_5` model) via Cloudflare Worker proxy
-- **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
+- **Screen Capture**: ScreenCaptureKit (macOS 14.2+). Captures only the frontmost app's focused window by default to reduce vision tokens (resolving exact Core Graphics identity). Supports explicit Shift+drag region capture and multi-monitor fallback.
 - **Voice Input**: Push-to-talk via `AVAudioEngine` + pluggable transcription-provider layer. System-wide keyboard shortcut via listen-only CGEvent tap.
 - **Element Pointing**: Claude embeds `[POINT:x,y:label:screenN]` tags in responses. The overlay parses these, maps coordinates to the correct monitor, and animates the blue cursor along a bezier arc to the target.
 - **Concurrency**: `@MainActor` isolation, async/await throughout
@@ -54,14 +54,23 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 |------|-------|---------|
 | `leanring_buddyApp.swift` | ~89 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager` and starts `CompanionManager`. No main window — the app lives entirely in the status bar. |
 | `CompanionManager.swift` | ~1026 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline. |
+| `AgentBackend.swift` | ~21 | Shared `@MainActor` protocol for interchangeable Claude and Codex agent backends. |
+| `AgentModelCatalog.swift` | ~76 | Shared model and reasoning-option types plus Claude's built-in model catalog and effort resolution. |
+| `CodexAgentSDKAPI.swift` | ~214 | Codex backend adapter. Reads account/model metadata, starts agent threads and turns, streams responses, and handles cancellation and timeouts. |
+| `CodexProcessManager.swift` | ~167 | Manages the local `codex app-server` process and its JSON-RPC request, initialization, notification, and shutdown lifecycle. |
+| `CodexHomeManager.swift` | ~35 | Creates an isolated app-owned Codex home and links the user's existing Codex authentication without modifying the global configuration. |
+| `ClickyCodexConfigTemplate.swift` | ~39 | Generates the isolated Codex configuration, including model, reasoning, sandbox, and computer-use server settings. |
+| `CodexRuntimeLocator.swift` | ~46 | Locates the local Codex executable and constructs the subprocess search path. |
 | `MenuBarPanelManager.swift` | ~243 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |
 | `CompanionPanelView.swift` | ~761 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, model picker (Sonnet/Opus), permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
 | `OverlayWindow.swift` | ~881 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. |
+| `PaulineCursorAppearance.swift` | ~38 | Cursor shape definitions shared by Pauline's overlay appearance controls. |
 | `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
-| `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
-| `BuddyDictationManager.swift` | ~866 | Push-to-talk voice pipeline. Handles microphone capture via `AVAudioEngine`, provider-aware permission checks, keyboard/button dictation sessions, transcript finalization, shortcut parsing, contextual keyterms, and live audio-level reporting for waveform feedback. |
+| `CompanionScreenCaptureUtility.swift` | ~267 | Screenshot capture using ScreenCaptureKit. Captures the exact focused window of the frontmost app to reduce token usage, falling back to full-display or explicit region capture as needed. |
+| `BuddyDictationManager.swift` | ~1070 | Push-to-talk voice pipeline. Handles microphone capture via `AVAudioEngine`, provider-aware permission checks, keyboard/button dictation sessions, transcript finalization, shortcut parsing, contextual keyterms, and live audio-level reporting for waveform feedback. Tracks a session generation counter so stale async callbacks from an already-ended session can't act on whatever session is live now, and recovers from a mid-recording device change instead of just the ones it initiates itself. |
+| `MicrophoneSelectionSupport.swift` | ~105 | CoreAudio input-device enumeration and UID/default-device lookup backing the microphone picker. Used by `BuddyDictationManager` and `CompanionManager`. |
 | `BuddyTranscriptionProvider.swift` | ~100 | Protocol surface and provider factory for voice transcription backends. Resolves provider based on `VoiceTranscriptionProvider` in Info.plist — AssemblyAI, OpenAI, or Apple Speech. |
-| `AssemblyAIStreamingTranscriptionProvider.swift` | ~478 | Streaming transcription provider. Fetches temp tokens from the Cloudflare Worker, opens an AssemblyAI v3 websocket, streams PCM16 audio, tracks turn-based transcripts, and delivers finalized text on key-up. Shares a single URLSession across all sessions. |
+| `AssemblyAIStreamingTranscriptionProvider.swift` | ~492 | Streaming transcription provider. Fetches temp tokens from the Cloudflare Worker, opens an AssemblyAI v3 websocket, streams PCM16 audio, tracks turn-based transcripts, and delivers finalized text on key-up. Shares a single URLSession across all sessions. `cancel()` is terminal — it blocks any further final-transcript or error delivery even if the socket close races with an in-flight message. |
 | `OpenAIAudioTranscriptionProvider.swift` | ~317 | Upload-based transcription provider. Buffers push-to-talk audio locally, uploads as WAV on release, returns finalized transcript. |
 | `AppleSpeechTranscriptionProvider.swift` | ~147 | Local fallback transcription provider backed by Apple's Speech framework. |
 | `BuddyAudioConversionSupport.swift` | ~108 | Audio conversion helpers. Converts live mic buffers to PCM16 mono audio and builds WAV payloads for upload-based providers. |
@@ -165,3 +174,13 @@ When you make changes to this project that affect the information in this file, 
 6. **Line count drift**: If a file's line count changes significantly (>50 lines), update the approximate count in the Key Files table
 
 Do NOT update this file for minor edits, bug fixes, or changes that don't affect the documented architecture or conventions.
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).
