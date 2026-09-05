@@ -8,18 +8,20 @@ class CodexHomeManager {
     init() {
         let fm = FileManager.default
         let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-        homeDirectory = support.appendingPathComponent("Clicky/CodexHome")
+        // V6 keeps its account session separate so sign-in and sign-out never
+        // alter the existing Pauline V5 Codex installation.
+        homeDirectory = support.appendingPathComponent("Pauline V6/CodexHome")
     }
     
     func setupHome(model: String, sandboxMode: String, reasoningEffort: String) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: homeDirectory, withIntermediateDirectories: true)
         
-        let globalAuth = fm.homeDirectoryForCurrentUser.appendingPathComponent(".codex/auth.json")
         let localAuth = homeDirectory.appendingPathComponent("auth.json")
-        try? fm.removeItem(at: localAuth)
-        if fm.fileExists(atPath: globalAuth.path) {
-            try? fm.createSymbolicLink(at: localAuth, withDestinationURL: globalAuth)
+        // Remove only a legacy V6-local symlink. The app-server owns the
+        // replacement credential after the user completes ChatGPT sign-in.
+        if let _ = try? fm.destinationOfSymbolicLink(atPath: localAuth.path) {
+            try? fm.removeItem(at: localAuth)
         }
         
         // Touch empty memory

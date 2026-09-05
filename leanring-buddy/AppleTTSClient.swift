@@ -28,19 +28,22 @@ public class AppleTTSClient: NSObject, AVSpeechSynthesizerDelegate {
         cachedEnglishVoices
     }
     
-    private static func selectedSystemVoice() -> AVSpeechSynthesisVoice? {
-        guard let id = UserDefaults.standard.string(forKey: selectedVoiceIdentifierDefaultsKey), !id.isEmpty else {
+    /// Keeps an Edge picker id from ever reaching AVSpeechSynthesizer, which
+    /// otherwise silently falls back to the system voice and looks like the
+    /// user's selection was ignored.
+    public static func appleSpeechVoiceIdentifier(from selectedVoiceIdentifier: String?) -> String? {
+        guard let selectedVoiceIdentifier, !selectedVoiceIdentifier.isEmpty,
+              !selectedVoiceIdentifier.hasPrefix("edge:") else {
             return nil
         }
-        if id.hasPrefix("edge:") {
-            return nil
-        }
-        return AVSpeechSynthesisVoice(identifier: id)
+        return selectedVoiceIdentifier
     }
     
-    public func speakText(_ text: String) async throws {
+    public func speakText(_ text: String, voiceIdentifier: String? = nil) async throws {
         let utterance = AVSpeechUtterance(string: text)
-        utterance.voice = Self.selectedSystemVoice() ?? AVSpeechSynthesisVoice(language: "en-US")
+        let resolvedVoiceIdentifier = Self.appleSpeechVoiceIdentifier(from: voiceIdentifier)
+        utterance.voice = resolvedVoiceIdentifier.flatMap(AVSpeechSynthesisVoice.init(identifier:))
+            ?? AVSpeechSynthesisVoice(language: "en-US")
         
         hasPendingUtterance = true
         synthesizer.speak(utterance)

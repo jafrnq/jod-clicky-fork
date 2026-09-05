@@ -711,11 +711,24 @@ struct CompanionPanelView: View {
                         .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
                 )
             } else {
-                Text(UserDefaults.standard.string(forKey: "codexModel") ?? "gpt-5.4-mini")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(DS.Colors.textTertiary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
+                if companionManager.availableCodexModels.isEmpty {
+                    Text("Connect ChatGPT")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                } else {
+                    Picker("", selection: Binding(
+                        get: { companionManager.selectedCodexModel },
+                        set: { companionManager.setSelectedCodexModel($0) }
+                    )) {
+                        ForEach(companionManager.availableCodexModels) { model in
+                            Text(model.displayName).tag(model.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .tint(DS.Colors.textSecondary)
+                }
             }
         }
         .padding(.vertical, 4)
@@ -745,19 +758,28 @@ struct CompanionPanelView: View {
     private var codexStatusRow: some View {
         let isConnected: Bool
         let statusText: String
+        let actionTitle: String?
         switch companionManager.codexAccountStatus {
-        case .ready:
+        case .ready(let plan):
             isConnected = true
-            statusText = "Connected"
+            statusText = "Connected · \(plan)"
+            actionTitle = "Sign Out"
+        case .signingIn:
+            isConnected = false
+            statusText = "Finish sign-in in browser"
+            actionTitle = nil
         case .notAuthenticated:
             isConnected = false
             statusText = "Not Authenticated"
+            actionTitle = "Connect"
         case .notInstalled:
             isConnected = false
             statusText = "Not Installed"
+            actionTitle = nil
         case .failed:
             isConnected = false
             statusText = "Failed"
+            actionTitle = "Retry"
         }
         
         return HStack {
@@ -774,6 +796,20 @@ struct CompanionPanelView: View {
                 Text(statusText)
                     .font(.system(size: 11, weight: .medium))
                     .foregroundColor(isConnected ? DS.Colors.success : DS.Colors.warning)
+            }
+
+            if let actionTitle {
+                Button(actionTitle) {
+                    if isConnected {
+                        companionManager.logoutCodexAccount()
+                    } else {
+                        companionManager.connectCodexAccount()
+                    }
+                }
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(DS.Colors.textPrimary)
+                .buttonStyle(.plain)
+                .pointerCursor()
             }
         }
         .padding(.vertical, 4)

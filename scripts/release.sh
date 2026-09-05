@@ -34,8 +34,8 @@ export PATH="/opt/homebrew/bin:$PATH"
 # ── Configuration ────────────────────────────────────────────────────────────
 
 SCHEME="leanring-buddy"
-APP_NAME="makesomething"
-APP_BUNDLE_NAME="Pauline"
+APP_NAME="Pauline-V6"
+APP_BUNDLE_NAME="Pauline V6"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 BUILD_DIR="${PROJECT_DIR}/build"
 ARCHIVE_PATH="${BUILD_DIR}/${APP_NAME}.xcarchive"

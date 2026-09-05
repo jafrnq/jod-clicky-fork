@@ -76,8 +76,15 @@ final class CompanionManager: ObservableObject {
     /// True when the selected voice is an Edge neural voice (id starts with "edge:").
     private var selectedEdgeVoiceID: String? {
         guard EdgeTTSClient.isAvailable,
-              let id = selectedVoiceIdentifier, id.hasPrefix("edge:") else { return nil }
+              let id = selectedVoiceIdentifier,
+              EdgeTTSClient.availableVoices().contains(where: { $0.id == id }) else { return nil }
         return String(id.dropFirst("edge:".count))
+    }
+
+    /// Capture the Apple voice at queue time so changing the picker while an
+    /// answer is still streaming cannot change an already-queued utterance.
+    private var selectedAppleVoiceIdentifier: String? {
+        AppleTTSClient.appleSpeechVoiceIdentifier(from: selectedVoiceIdentifier)
     }
 
     private var pendingSpokenSentences = 0
@@ -98,12 +105,12 @@ final class CompanionManager: ObservableObject {
             if let edgeVoice = selectedEdgeVoiceID, EdgeTTSClient.isAvailable {
                 try await edgeTTS.speakText(text, voice: edgeVoice)
             } else {
-                try await appleTTS.speakText(text)
+                try await appleTTS.speakText(text, voiceIdentifier: selectedAppleVoiceIdentifier)
             }
         } catch {
             print("⚠️ TTS failed: \(error), retrying with AppleTTS")
             do {
-                try await appleTTS.speakText(text)
+                try await appleTTS.speakText(text, voiceIdentifier: selectedAppleVoiceIdentifier)
             } catch {
                 print("⚠️ AppleTTS fallback failed: \(error)")
             }
@@ -148,7 +155,9 @@ final class CompanionManager: ObservableObject {
         speechFlushTask?.cancel()
         let currentGen = ttsGeneration
         speechFlushTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 700_000_000)
+            // A short idle flush gets the first response fragment speaking
+            // promptly when the model pauses before finishing a sentence.
+            try? await Task.sleep(nanoseconds: 350_000_000)
             guard !Task.isCancelled, let self, self.ttsGeneration == currentGen else { return }
             let buffer = self.streamedSpeechBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
             if !buffer.isEmpty, !buffer.contains("[POINT:"), !buffer.contains("[RUN:"), !buffer.contains("[ASK:") {
@@ -234,6 +243,7 @@ final class CompanionManager: ObservableObject {
         let generation = ttsGeneration
         let previous = speechChain
         let edgeVoice = selectedEdgeVoiceID
+        let appleVoiceIdentifier = selectedAppleVoiceIdentifier
         let shouldPrefetch = edgeVoice != nil && pendingSpokenSentences <= 3
         let synthesis: Task<URL?, Never>? = shouldPrefetch ? Task { [weak self] in
             guard let self, let v = edgeVoice else { return nil }
@@ -256,7 +266,7 @@ final class CompanionManager: ObservableObject {
                     await self.edgeTTS.play(fileAt: u)
                 }
             } else {
-                try? await self.appleTTS.speakText(trimmed)
+                try? await self.appleTTS.speakText(trimmed, voiceIdentifier: appleVoiceIdentifier)
             }
         }
     }
@@ -382,6 +392,10 @@ final class CompanionManager: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self = self else { return }
             self.codexAccountStatus = await self.codexAgentSDK.readAccountStatus()
+            guard case .ready = self.codexAccountStatus else {
+                self.codexModelCatalogState = .unavailable(reason: "Connect ChatGPT to load models")
+                return
+            }
             do {
                 let models = try await self.codexAgentSDK.listAvailableModels()
                 self.codexModelCatalogState = .loaded(models)
@@ -389,6 +403,26 @@ final class CompanionManager: ObservableObject {
             } catch {
                 self.codexModelCatalogState = .unavailable(reason: "Couldn't read models")
             }
+        }
+    }
+
+    var availableCodexModels: [AgentModelOption] {
+        guard case .loaded(let models) = codexModelCatalogState else { return [] }
+        return models
+    }
+
+    func connectCodexAccount() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.codexAccountStatus = await self.codexAgentSDK.startChatGPTLogin()
+        }
+    }
+
+    func logoutCodexAccount() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.codexAccountStatus = await self.codexAgentSDK.logout()
+            self.codexModelCatalogState = .unavailable(reason: "Connect ChatGPT to load models")
         }
     }
 
@@ -432,7 +466,7 @@ final class CompanionManager: ObservableObject {
         codexAgentSDK.maxOutputTokens = enabled ? 600 : 180
     }
 
-    @Published private(set) var selectedBackend: String = UserDefaults.standard.string(forKey: "clickyBackend") ?? "claude"
+    @Published private(set) var selectedBackend: String = UserDefaults.standard.string(forKey: "clickyBackend") ?? "codex"
     
     func setSelectedBackend(_ backend: String) {
         let valid = backend == "codex" ? "codex" : "claude"
@@ -440,7 +474,19 @@ final class CompanionManager: ObservableObject {
         UserDefaults.standard.set(valid, forKey: "clickyBackend")
         resolveCurrentReasoning()
     }
-    private lazy var codexAgentSDK: CodexAgentSDKAPI = CodexAgentSDKAPI()
+    private lazy var codexAgentSDK: CodexAgentSDKAPI = {
+        let codexAgentSDK = CodexAgentSDKAPI()
+        codexAgentSDK.onAccountStatusChanged = { [weak self] accountStatus in
+            guard let self else { return }
+            self.codexAccountStatus = accountStatus
+            if case .ready = accountStatus {
+                self.refreshCodexModelCatalog()
+            } else {
+                self.codexModelCatalogState = .unavailable(reason: "Connect ChatGPT to load models")
+            }
+        }
+        return codexAgentSDK
+    }()
     
 
     

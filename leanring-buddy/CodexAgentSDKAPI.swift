@@ -4,6 +4,7 @@ import AppKit
 @MainActor
 enum CodexAccountStatus {
     case ready(plan: String)
+    case signingIn
     case notAuthenticated
     case notInstalled
     case failed(message: String)
@@ -17,16 +18,17 @@ final class CodexAgentSDKAPI: AgentBackend {
     private var resolvedReasoningEffort: String = "high"
     private var isStarted = false
 
+    /// Called after app-server reports that a browser sign-in changed the account.
+    /// The panel owns presentation state, so the SDK only reports the new status.
+    var onAccountStatusChanged: (@MainActor (CodexAccountStatus) -> Void)?
+
     func applyConfiguration(model: String, reasoningEffort: String) {
         self.resolvedModelId = model
         self.resolvedReasoningEffort = reasoningEffort
     }
 
     func listAvailableModels() async throws -> [AgentModelOption] {
-        if !isStarted {
-            try processManager.start(model: resolvedModelId, sandboxMode: agentModeEnabled ? "danger-full-access" : "workspace-write", reasoningEffort: resolvedReasoningEffort)
-            isStarted = true
-        }
+        try ensureStarted()
         var allModels: [AgentModelOption] = []
         var nextCursor: String? = nil
         repeat {
@@ -54,24 +56,57 @@ final class CodexAgentSDKAPI: AgentBackend {
 
     func readAccountStatus() async -> CodexAccountStatus {
         do {
-            if !isStarted {
-                try processManager.start(model: resolvedModelId, sandboxMode: agentModeEnabled ? "danger-full-access" : "workspace-write", reasoningEffort: resolvedReasoningEffort)
-                isStarted = true
-            }
+            try ensureStarted()
             let res = try await processManager.sendRequest(method: "account/read", params: [:])
-            if let reqAuth = res["requiresOpenaiAuth"] as? Bool, reqAuth {
-                return .notAuthenticated
-            }
-            if let acc = res["account"] as? [String: Any], let plan = acc["planType"] as? String {
-                return .ready(plan: plan)
-            }
-            return .ready(plan: "unknown")
+            return Self.accountStatus(from: res)
         } catch {
             let nsErr = error as NSError
             if nsErr.domain == "CodexProcess" && nsErr.code == 1 {
                 return .notInstalled
             }
             return .failed(message: nsErr.localizedDescription)
+        }
+    }
+
+    /// Decodes account/read without treating the advisory requiresOpenaiAuth
+    /// field as stronger evidence than a returned ChatGPT account.
+    static func accountStatus(from response: [String: Any]) -> CodexAccountStatus {
+        if let account = response["account"] as? [String: Any],
+           let accountType = account["type"] as? String,
+           accountType == "chatgpt" {
+            return .ready(plan: account["planType"] as? String ?? "unknown")
+        }
+        return .notAuthenticated
+    }
+
+    /// Starts Codex's supported ChatGPT browser sign-in and leaves credentials
+    /// in Pauline V6's isolated CODEX_HOME rather than borrowing V5's auth file.
+    func startChatGPTLogin() async -> CodexAccountStatus {
+        do {
+            try ensureStarted()
+            let response = try await processManager.sendRequest(
+                method: "account/login/start",
+                params: ["type": "chatgpt", "useHostedLoginSuccessPage": true]
+            )
+            guard let authURLString = response["authUrl"] as? String,
+                  let authURL = URL(string: authURLString) else {
+                return .failed(message: "Codex did not provide a ChatGPT sign-in link.")
+            }
+            NSWorkspace.shared.open(authURL)
+            return .signingIn
+        } catch {
+            return .failed(message: error.localizedDescription)
+        }
+    }
+
+    func logout() async -> CodexAccountStatus {
+        do {
+            try ensureStarted()
+            _ = try await processManager.sendRequest(method: "account/logout", params: [:])
+            threadId = nil
+            return .notAuthenticated
+        } catch {
+            return .failed(message: error.localizedDescription)
         }
     }
     
@@ -108,7 +143,12 @@ final class CodexAgentSDKAPI: AgentBackend {
         
         let params = json["params"] as? [String: Any] ?? [:]
         
-        if method == "item/agentMessage/delta", let text = params["delta"] as? String {
+        if method == "account/login/completed" || method == "account/updated" {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.onAccountStatusChanged?(await self.readAccountStatus())
+            }
+        } else if method == "item/agentMessage/delta", let text = params["delta"] as? String {
             accumulatedOutput += text
             currentTextChunkHandler?(text)
         } else if method == "item/commandExecution/outputDelta", let text = params["delta"] as? String {
@@ -143,11 +183,18 @@ final class CodexAgentSDKAPI: AgentBackend {
     
     func warmUp(systemPrompt: String) {
         Task {
-            if !isStarted {
-                try processManager.start(model: resolvedModelId, sandboxMode: agentModeEnabled ? "danger-full-access" : "workspace-write", reasoningEffort: resolvedReasoningEffort)
-                isStarted = true
-            }
+            try? ensureStarted()
         }
+    }
+
+    private func ensureStarted() throws {
+        guard !isStarted else { return }
+        try processManager.start(
+            model: resolvedModelId,
+            sandboxMode: agentModeEnabled ? "danger-full-access" : "workspace-write",
+            reasoningEffort: resolvedReasoningEffort
+        )
+        isStarted = true
     }
     
     func stop() {

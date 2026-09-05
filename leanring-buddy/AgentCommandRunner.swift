@@ -2,7 +2,7 @@ import AppKit
 import Darwin
 
 @MainActor enum AgentCommandRunner {
-    static let workspaceURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".clicky/workspace", isDirectory: true)
+    static let workspaceURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".pauline-v6/workspace", isDirectory: true)
     static let proceduresURL = workspaceURL.appendingPathComponent("procedures", isDirectory: true)
     
     static func ensureWorkspaceExists() {

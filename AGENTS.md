@@ -14,7 +14,7 @@ All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in th
 - **App Type**: Menu bar-only (`LSUIElement=true`), no dock icon or main window
 - **Framework**: SwiftUI (macOS native) with AppKit bridging for menu bar panel and cursor overlay
 - **Pattern**: MVVM with `@StateObject` / `@Published` state management
-- **AI Chat**: Selectable Claude or Codex backend. Claude uses the local Agent SDK bridge; Codex uses the local `codex app-server` over JSON-RPC with the user's ChatGPT subscription.
+- **AI Chat**: Selectable Claude or Codex backend. Claude uses the local Agent SDK bridge; Codex uses the local `codex app-server` over JSON-RPC with the user's ChatGPT subscription. Pauline V6 keeps its Codex credentials in an app-owned home and starts sign-in through app-server, so it does not share or mutate Pauline V5's session.
 - **Speech-to-Text**: AssemblyAI real-time streaming (`u3-rt-pro` model) via websocket, with OpenAI and Apple Speech as fallbacks
 - **Text-to-Speech**: ElevenLabs (`eleven_flash_v2_5` model) via Cloudflare Worker proxy
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+). Captures only the frontmost app's focused window by default to reduce vision tokens (resolving exact Core Graphics identity). Supports explicit Shift+drag region capture and multi-monitor fallback.
@@ -56,9 +56,9 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `CompanionManager.swift` | ~1026 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline. |
 | `AgentBackend.swift` | ~21 | Shared `@MainActor` protocol for interchangeable Claude and Codex agent backends. |
 | `AgentModelCatalog.swift` | ~76 | Shared model and reasoning-option types plus Claude's built-in model catalog and effort resolution. |
-| `CodexAgentSDKAPI.swift` | ~214 | Codex backend adapter. Reads account/model metadata, starts agent threads and turns, streams responses, and handles cancellation and timeouts. |
+| `CodexAgentSDKAPI.swift` | ~260 | Codex backend adapter. Starts supported ChatGPT browser sign-in, reads account/model metadata, starts agent threads and turns, streams responses, and handles cancellation and timeouts. |
 | `CodexProcessManager.swift` | ~167 | Manages the local `codex app-server` process and its JSON-RPC request, initialization, notification, and shutdown lifecycle. |
-| `CodexHomeManager.swift` | ~35 | Creates an isolated app-owned Codex home and links the user's existing Codex authentication without modifying the global configuration. |
+| `CodexHomeManager.swift` | ~35 | Creates the isolated Pauline V6 Codex home; app-server owns its independent ChatGPT credentials. |
 | `ClickyCodexConfigTemplate.swift` | ~39 | Generates the isolated Codex configuration, including model, reasoning, sandbox, and computer-use server settings. |
 | `CodexRuntimeLocator.swift` | ~46 | Locates the local Codex executable and constructs the subprocess search path. |
 | `MenuBarPanelManager.swift` | ~243 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |

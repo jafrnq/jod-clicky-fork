@@ -5,7 +5,7 @@ struct AgentReasoningOption: Equatable {
     let displayName: String
 }
 
-struct AgentModelOption: Equatable {
+struct AgentModelOption: Equatable, Identifiable {
     let id: String
     let displayName: String
     let isDefault: Bool

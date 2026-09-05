@@ -49,7 +49,8 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         if !companionManager.hasCompletedOnboarding || !companionManager.allPermissionsGranted {
             menuBarPanelManager?.showPanelOnLaunch()
         }
-        registerAsLoginItemIfNeeded()
+        // V6 never registers itself automatically. This lets it be tested
+        // alongside Pauline V5 without replacing V5's login-item behavior.
         // startSparkleUpdater()
     }
 
