@@ -52,9 +52,9 @@ final class CodexAgentSDKAPI: AgentBackend {
             ?? (response["items"] as? [[String: Any]])
             ?? []
 
-        return modelRows.compactMap { modelRow in
+        return modelRows.compactMap { modelRow -> AgentModelOption? in
             guard let id = modelRow["id"] as? String else { return nil }
-            let supportedEfforts = (modelRow["supportedReasoningEfforts"] as? [[String: Any]] ?? []).compactMap { effortRow in
+            let supportedEfforts = (modelRow["supportedReasoningEfforts"] as? [[String: Any]] ?? []).compactMap { effortRow -> AgentReasoningOption? in
                 guard let effort = effortRow["reasoningEffort"] as? String else { return nil }
                 return AgentReasoningOption(
                     value: effort,
