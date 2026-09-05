@@ -65,6 +65,11 @@ struct leanring_buddyTests {
         #expect(turnIdentifier == "turn_456")
     }
 
+    @Test @MainActor func codexThreadStartUsesRuntimeCompatibleSandboxValues() {
+        #expect(CodexAgentSDKAPI.threadSandboxMode(agentModeEnabled: false) == "workspace-write")
+        #expect(CodexAgentSDKAPI.threadSandboxMode(agentModeEnabled: true) == "danger-full-access")
+    }
+
     @Test func edgeVoiceIdentifierIsNeverPassedToAppleSpeech() {
         #expect(AppleTTSClient.appleSpeechVoiceIdentifier(from: "edge:en-US-EmmaMultilingualNeural") == nil)
         #expect(AppleTTSClient.appleSpeechVoiceIdentifier(from: "com.apple.voice.compact.en-US.Samantha") == "com.apple.voice.compact.en-US.Samantha")

@@ -82,6 +82,13 @@ final class CodexAgentSDKAPI: AgentBackend {
             ?? response["turnId"] as? String
     }
 
+    /// The bundled Codex app-server accepts these legacy hyphenated sandbox
+    /// values for `thread/start`, even though newer protocol documentation also
+    /// describes structured camel-case sandbox policies for turn-level overrides.
+    static func threadSandboxMode(agentModeEnabled: Bool) -> String {
+        agentModeEnabled ? "danger-full-access" : "workspace-write"
+    }
+
     func readAccountStatus() async -> CodexAccountStatus {
         do {
             try ensureStarted()
@@ -253,7 +260,7 @@ final class CodexAgentSDKAPI: AgentBackend {
             var threadStartParameters: [String: Any] = [
                 "cwd": NSHomeDirectory(),
                 "developerInstructions": systemPrompt,
-                "sandbox": agentModeEnabled ? "dangerFullAccess" : "workspaceWrite"
+                "sandbox": Self.threadSandboxMode(agentModeEnabled: agentModeEnabled)
             ]
             // Omit an unknown persisted model until the dynamic catalog has
             // confirmed it. App-server then selects the account's default.
