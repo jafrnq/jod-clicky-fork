@@ -37,6 +37,34 @@ struct leanring_buddyTests {
         }
     }
 
+    @Test @MainActor func currentCodexModelListResponsePopulatesThePicker() {
+        let models = CodexAgentSDKAPI.modelOptions(from: [
+            "data": [[
+                "id": "gpt-5.6-sol",
+                "displayName": "GPT-5.6-Sol",
+                "defaultReasoningEffort": "low",
+                "supportedReasoningEfforts": [["reasoningEffort": "low"]],
+                "isDefault": true
+            ]]
+        ])
+
+        #expect(models.count == 1)
+        #expect(models.first?.id == "gpt-5.6-sol")
+        #expect(models.first?.isDefault == true)
+    }
+
+    @Test @MainActor func currentCodexThreadAndTurnResponsesUseNestedIdentifiers() {
+        let threadIdentifier = CodexAgentSDKAPI.threadIdentifier(from: [
+            "thread": ["id": "thr_123"]
+        ])
+        let turnIdentifier = CodexAgentSDKAPI.turnIdentifier(from: [
+            "turn": ["id": "turn_456"]
+        ])
+
+        #expect(threadIdentifier == "thr_123")
+        #expect(turnIdentifier == "turn_456")
+    }
+
     @Test func edgeVoiceIdentifierIsNeverPassedToAppleSpeech() {
         #expect(AppleTTSClient.appleSpeechVoiceIdentifier(from: "edge:en-US-EmmaMultilingualNeural") == nil)
         #expect(AppleTTSClient.appleSpeechVoiceIdentifier(from: "com.apple.voice.compact.en-US.Samantha") == "com.apple.voice.compact.en-US.Samantha")

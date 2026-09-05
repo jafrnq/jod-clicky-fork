@@ -17,6 +17,7 @@ final class CodexAgentSDKAPI: AgentBackend {
     private var resolvedModelId: String = "gpt-5.4-mini"
     private var resolvedReasoningEffort: String = "high"
     private var isStarted = false
+    private var knownModelIDs = Set<String>()
 
     /// Called after app-server reports that a browser sign-in changed the account.
     /// The panel owns presentation state, so the SDK only reports the new status.
@@ -32,26 +33,53 @@ final class CodexAgentSDKAPI: AgentBackend {
         var allModels: [AgentModelOption] = []
         var nextCursor: String? = nil
         repeat {
-            var params: [String: Any] = ["includeHidden": false]
+            var params: [String: Any] = ["limit": 100, "includeHidden": false]
             if let cursor = nextCursor { params["nextCursor"] = cursor }
-            let res = try await processManager.sendRequest(method: "model/list", params: params)
-            if let items = res["items"] as? [[String: Any]] {
-                for item in items {
-                    guard let id = item["id"] as? String,
-                          let displayName = item["displayName"] as? String,
-                          let defaultEffort = item["defaultReasoningEffort"] as? String,
-                          let supported = item["supportedReasoningEfforts"] as? [[String: Any]] else { continue }
-                    let isDefault = item["isDefault"] as? Bool ?? false
-                    let efforts = supported.compactMap { dict -> AgentReasoningOption? in
-                        guard let eff = dict["reasoningEffort"] as? String else { return nil }
-                        return AgentReasoningOption(value: eff, displayName: eff.prefix(1).uppercased() + eff.dropFirst())
-                    }
-                    allModels.append(AgentModelOption(id: id, displayName: displayName, isDefault: isDefault, supportedReasoningEfforts: efforts, defaultReasoningEffort: defaultEffort))
-                }
-            }
-            nextCursor = res["nextCursor"] as? String
+            let response = try await processManager.sendRequest(method: "model/list", params: params)
+            let pageModels = Self.modelOptions(from: response)
+            allModels.append(contentsOf: pageModels)
+            knownModelIDs.formUnion(pageModels.map(\.id))
+            nextCursor = response["nextCursor"] as? String
         } while nextCursor != nil
         return allModels
+    }
+
+    /// Current app-server returns model rows in `data`; earlier versions used
+    /// `items`. Supporting both lets Pauline V6 work across installed Codex
+    /// versions without presenting an authenticated account as disconnected.
+    static func modelOptions(from response: [String: Any]) -> [AgentModelOption] {
+        let modelRows = (response["data"] as? [[String: Any]])
+            ?? (response["items"] as? [[String: Any]])
+            ?? []
+
+        return modelRows.compactMap { modelRow in
+            guard let id = modelRow["id"] as? String else { return nil }
+            let supportedEfforts = (modelRow["supportedReasoningEfforts"] as? [[String: Any]] ?? []).compactMap { effortRow in
+                guard let effort = effortRow["reasoningEffort"] as? String else { return nil }
+                return AgentReasoningOption(
+                    value: effort,
+                    displayName: effort.prefix(1).uppercased() + effort.dropFirst()
+                )
+            }
+            let defaultEffort = (modelRow["defaultReasoningEffort"] as? String) ?? supportedEfforts.first?.value ?? "medium"
+            return AgentModelOption(
+                id: id,
+                displayName: modelRow["displayName"] as? String ?? id,
+                isDefault: modelRow["isDefault"] as? Bool ?? false,
+                supportedReasoningEfforts: supportedEfforts,
+                defaultReasoningEffort: defaultEffort
+            )
+        }
+    }
+
+    static func threadIdentifier(from response: [String: Any]) -> String? {
+        (response["thread"] as? [String: Any])?["id"] as? String
+            ?? response["threadId"] as? String
+    }
+
+    static func turnIdentifier(from response: [String: Any]) -> String? {
+        (response["turn"] as? [String: Any])?["id"] as? String
+            ?? response["turnId"] as? String
     }
 
     func readAccountStatus() async -> CodexAccountStatus {
@@ -161,10 +189,15 @@ final class CodexAgentSDKAPI: AgentBackend {
             currentTextChunkHandler?(wrapped)
         } else if method == "turn/completed" || method == "turn/complete" {
             // Check if it's for our turn
-            if let tId = params["turnId"] as? String, tId != turnId && turnId != nil {
+            let completedTurnIdentifier = Self.turnIdentifier(from: params)
+            if let completedTurnIdentifier, completedTurnIdentifier != turnId && turnId != nil {
                 return
             }
-            finishTurn()
+            if let errorMessage = params["error"] as? String, !errorMessage.isEmpty {
+                finishTurn(error: NSError(domain: "CodexAPI", code: -41, userInfo: [NSLocalizedDescriptionKey: errorMessage]))
+            } else {
+                finishTurn()
+            }
         }
     }
     
@@ -217,16 +250,21 @@ final class CodexAgentSDKAPI: AgentBackend {
         accumulatedOutput = ""
         
         if threadId == nil {
-            let threadRes = try await processManager.sendRequest(method: "thread/start", params: [
-                "model": resolvedModelId,
+            var threadStartParameters: [String: Any] = [
                 "cwd": NSHomeDirectory(),
                 "developerInstructions": systemPrompt,
-                "sandbox": agentModeEnabled ? "danger-full-access" : "workspace-write"
-            ])
-            guard let tId = threadRes["threadId"] as? String else {
+                "sandbox": agentModeEnabled ? "dangerFullAccess" : "workspaceWrite"
+            ]
+            // Omit an unknown persisted model until the dynamic catalog has
+            // confirmed it. App-server then selects the account's default.
+            if knownModelIDs.contains(resolvedModelId) {
+                threadStartParameters["model"] = resolvedModelId
+            }
+            let threadResponse = try await processManager.sendRequest(method: "thread/start", params: threadStartParameters)
+            guard let threadIdentifier = Self.threadIdentifier(from: threadResponse) else {
                 throw NSError(domain: "CodexAPI", code: 2, userInfo: [NSLocalizedDescriptionKey: "No threadId"])
             }
-            self.threadId = tId
+            self.threadId = threadIdentifier
         }
         guard let threadId = self.threadId else { return ("", 0) }
         
@@ -245,8 +283,8 @@ final class CodexAgentSDKAPI: AgentBackend {
             "input": inputList
         ]
         
-        let turnRes = try await processManager.sendRequest(method: "turn/start", params: turnParams)
-        self.turnId = turnRes["turnId"] as? String
+        let turnResponse = try await processManager.sendRequest(method: "turn/start", params: turnParams)
+        self.turnId = Self.turnIdentifier(from: turnResponse)
         
         return try await withCheckedThrowingContinuation { continuation in
             self.activeTurnContinuation = continuation

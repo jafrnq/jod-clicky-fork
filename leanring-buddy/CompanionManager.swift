@@ -398,10 +398,12 @@ final class CompanionManager: ObservableObject {
             }
             do {
                 let models = try await self.codexAgentSDK.listAvailableModels()
-                self.codexModelCatalogState = .loaded(models)
+                self.codexModelCatalogState = models.isEmpty
+                    ? .unavailable(reason: "No ChatGPT models are available")
+                    : .loaded(models)
                 self.resolveCurrentReasoning()
             } catch {
-                self.codexModelCatalogState = .unavailable(reason: "Couldn't read models")
+                self.codexModelCatalogState = .unavailable(reason: "Couldn't load models: \(error.localizedDescription)")
             }
         }
     }
@@ -409,6 +411,24 @@ final class CompanionManager: ObservableObject {
     var availableCodexModels: [AgentModelOption] {
         guard case .loaded(let models) = codexModelCatalogState else { return [] }
         return models
+    }
+
+    var codexModelPickerStatusText: String {
+        switch codexModelCatalogState {
+        case .notLoaded, .loading:
+            return "Loading models…"
+        case .loaded:
+            return "No ChatGPT models available"
+        case .unavailable(let reason):
+            return reason
+        }
+    }
+
+    var canRefreshCodexModelCatalog: Bool {
+        if case .ready = codexAccountStatus {
+            return availableCodexModels.isEmpty
+        }
+        return false
     }
 
     func connectCodexAccount() {
@@ -1376,7 +1396,7 @@ final class CompanionManager: ObservableObject {
                 responseOverlay.hideOverlay()
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
-                speakCreditsErrorFallback()
+                speakResponseError(error)
             }
 
             if !Task.isCancelled {
@@ -1421,9 +1441,28 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message using macOS system TTS when API
-    /// credits run out. Uses NSSpeechSynthesizer so it works even when
-    /// the TTS service is down.
+    /// Reserves the credits message for confirmed quota failures. Protocol and
+    /// connectivity problems need actionable language instead of implying that
+    /// the user's ChatGPT plan has run out.
+    private func speakResponseError(_ error: Error) {
+        let normalizedErrorDescription = error.localizedDescription.lowercased()
+        let isUsageLimitError = normalizedErrorDescription.contains("rate limit")
+            || normalizedErrorDescription.contains("usage limit")
+            || normalizedErrorDescription.contains("quota")
+            || normalizedErrorDescription.contains("credits")
+        if isUsageLimitError {
+            speakCreditsErrorFallback()
+            return
+        }
+
+        let providerName = selectedBackend == "codex" ? "Codex" : "Claude"
+        let synthesizer = NSSpeechSynthesizer()
+        synthesizer.startSpeaking("I couldn't complete that \(providerName) request. Please try again.")
+        voiceState = .responding
+    }
+
+    /// Speaks a hardcoded error message using macOS system TTS when a provider
+    /// explicitly reports a quota or usage-limit failure.
     private func speakCreditsErrorFallback() {
         let utterance = "I'm all out of credits. Please DM Farza and tell him to bring me back to life."
         let synthesizer = NSSpeechSynthesizer()

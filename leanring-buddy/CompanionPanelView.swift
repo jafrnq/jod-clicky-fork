@@ -712,11 +712,23 @@ struct CompanionPanelView: View {
                 )
             } else {
                 if companionManager.availableCodexModels.isEmpty {
-                    Text("Connect ChatGPT")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(DS.Colors.textTertiary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 5)
+                    HStack(spacing: 6) {
+                        Text(companionManager.codexModelPickerStatusText)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(DS.Colors.textTertiary)
+                            .lineLimit(1)
+                        if companionManager.canRefreshCodexModelCatalog {
+                            Button("Retry") {
+                                companionManager.refreshCodexModelCatalog()
+                            }
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(DS.Colors.textPrimary)
+                            .buttonStyle(.plain)
+                            .pointerCursor()
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
                 } else {
                     Picker("", selection: Binding(
                         get: { companionManager.selectedCodexModel },

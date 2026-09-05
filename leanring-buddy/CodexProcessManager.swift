@@ -71,6 +71,8 @@ class CodexProcessManager {
                 self.pendingRequests.removeAll()
                 self.process = nil
                 self.stdoutBuffer = ""
+                self.hasInitialized = false
+                self.initTask = nil
             }
         }
         
@@ -89,6 +91,8 @@ class CodexProcessManager {
             pendingRequests.values.forEach { $0.resume(throwing: CancellationError()) }
             pendingRequests.removeAll()
             stdoutBuffer = ""
+            hasInitialized = false
+            initTask = nil
         }
     }
     
@@ -129,10 +133,11 @@ class CodexProcessManager {
                     } else {
                         _ = try await self.sendRequestInternal(method: "initialize", params: ["clientInfo": ["name": "Pauline", "version": "1.0"]])
                     }
+                    self.sendNotification(method: "initialized", params: [:])
                 }
                 initTask = task
-                hasInitialized = true
                 _ = try await task.value
+                hasInitialized = true
             }
         }
         
@@ -162,6 +167,21 @@ class CodexProcessManager {
                     continuation.resume(throwing: error)
                 }
             }
+        }
+    }
+
+    /// app-server requires this acknowledgement immediately after initialize.
+    /// It is a JSON-RPC notification, so it intentionally has no request id.
+    private func sendNotification(method: String, params: [String: Any]) {
+        queue.async {
+            let notification: [String: Any] = [
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params
+            ]
+            guard let data = try? JSONSerialization.data(withJSONObject: notification) else { return }
+            try? self.stdinPipe?.fileHandleForWriting.write(contentsOf: data)
+            try? self.stdinPipe?.fileHandleForWriting.write(contentsOf: Data("\n".utf8))
         }
     }
 }
